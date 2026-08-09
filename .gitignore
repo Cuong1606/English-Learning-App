@@ -9,7 +9,7 @@ venv/
 **/__pycache__/
 *.py[cod]
 
-# Large bundled audio (distributed separately in the Windows release asset)
+# Audio assets are kept outside the source repository
 audio/
 course_audio/
 

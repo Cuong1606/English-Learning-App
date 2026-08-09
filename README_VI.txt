@@ -52,3 +52,5 @@ V2.4.3
 - Launcher không phụ thuộc PowerShell.
 - Chỉ tái sử dụng server đúng cùng phiên bản để tránh mở nhầm bản cũ.
 - Common English Phrases đủ 852/852 audio.
+
+Tài nguyên audio khi khôi phục/build source: xem AUDIO_ASSETS.md.
