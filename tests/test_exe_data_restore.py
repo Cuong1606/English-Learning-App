@@ -310,6 +310,19 @@ def main(argv=None):
         assert_true(status == 200 and user_audio_before == TEST_AUDIO, "Seed user_audio mismatch")
         report["checks"].append("Seed progress/settings/Saved/My Island/user_audio")
 
+        http_json(port, "/api/data/reset-progress", {})
+        assert_true(table_count(db, "review_log") == 0, "Reset Progress retained review history")
+        assert_true(table_count(db, "saved_items") == 1, "Reset Progress removed Saved items")
+        assert_true(table_count(db, "my_islands") == 1, "Reset Progress removed My Island data")
+        assert_true(setting(db, "new_per_day") == "37", "Reset Progress changed Settings")
+        status, _headers, reset_audio = http_raw(port, f"/user-audio/{user_audio_name}")
+        assert_true(status == 200 and reset_audio == TEST_AUDIO, "Reset Progress removed user_audio")
+        report["checks"].append("Reset Progress clears learning history and preserves personal data")
+
+        # Recreate one review so Backup/Restore can prove Learn/Review state is
+        # included in the packaged EXE round trip.
+        http_json(port, "/api/review", {"item_key": first_item["item_key"], "rating": 4, "source_mode": "exe-test"})
+
         status, _headers, backup_raw = http_raw(port, "/api/data/backup", timeout=120)
         assert_true(status == 200 and backup_raw.startswith(b"PK"), "Backup ZIP download failed")
         backup_file = localappdata / "exe-user-data-backup.zip"
