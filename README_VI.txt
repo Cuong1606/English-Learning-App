@@ -1,4 +1,4 @@
-ENGLISH LEARNING APP V2.4.3
+ENGLISH LEARNING APP V1.1.0
 ===========================
 
 MỞ APP
@@ -40,12 +40,14 @@ DỮ LIỆU CÁ NHÂN TRÊN WINDOWS
 %LOCALAPPDATA%\EnglishLocal\user_data
 %LOCALAPPDATA%\EnglishLocal\user_audio
 Cập nhật app không làm mất tiến độ, My Islands hoặc lịch SRS nếu giữ thư mục trên.
+- Settings > Dữ liệu cho phép Reset, xóa sạch profile, sao lưu và khôi phục trực tiếp từ ZIP.
+- Khi khôi phục, app tự kiểm tra backup, tạo safety snapshot rồi đóng hoàn toàn. Ở lần mở app thủ công tiếp theo, dữ liệu được khôi phục đồng bộ trước khi database/server/UI khởi động; không cần giải nén backup và không chạy helper nền trong luồng bình thường.
 
 YÊU CẦU
 - Windows có Python 3.
 - Microsoft Edge hoặc Google Chrome.
 
-V2.4.3
+V1.1.0
 - Chỉ mở bằng start_app.bat.
 - Đã bỏ toàn bộ chức năng tạo icon Desktop và file launcher VBS bên ngoài.
 - Tự chọn port local còn trống, ưu tiên 8767.

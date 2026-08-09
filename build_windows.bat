@@ -10,6 +10,7 @@ echo ============================================================
 echo.
 
 if not exist "desktop_app.py" goto missing
+if not exist "restore_helper.py" goto missing
 if not exist "server.py" goto missing
 if not exist "web\index.html" goto missing
 if not exist "data\content.sqlite" goto missing
@@ -57,7 +58,7 @@ exit /b 0
 
 :missing
 echo LOI: Thu muc build khong du file app/data/audio.
-echo Hay chep bo dong goi nay vao thu muc English Learning App V2.4.3 day du.
+echo Hay chep bo dong goi nay vao thu muc English Learning App V1.1.0 day du.
 pause
 exit /b 2
 

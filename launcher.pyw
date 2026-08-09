@@ -8,9 +8,10 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 
+from app_version import APP_VERSION
+
 BASE = Path(__file__).resolve().parent
 SERVER = BASE / "server.py"
-APP_VERSION = "2.4.3"
 HOST = "127.0.0.1"
 PORTS = range(8767, 8800)
 

@@ -1,4 +1,4 @@
-ENGLISH LEARNING APP V2.4.3 - DONG GOI WINDOWS
+ENGLISH LEARNING APP V1.1.0 - DONG GOI WINDOWS
 
 MUC TIEU
 - Tao app Windows co cua so rieng.
@@ -7,8 +7,10 @@ MUC TIEU
 - App van chay local/offline; du lieu hoc ca nhan nam trong LocalAppData\EnglishLocal.
 
 CACH LAM
-1. Chep 6 file nay vao THU MUC GOC cua app V2.4.3 dang chay tot:
+1. Chep cac file nay vao THU MUC GOC cua app V1.1.0 dang chay tot:
+   app_version.py
    desktop_app.py
+   restore_helper.py
    server.py
    EnglishLearningApp.spec
    requirements-build.txt

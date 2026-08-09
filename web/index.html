@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>English Learning App V2.4.3</title>
+  <title>English Learning App V1.1.0</title>
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
@@ -36,8 +36,8 @@
   </main>
 </div>
 <div id="bottomPlayer" class="bottom-player hidden"></div>
-<div id="modal" class="modal hidden"><div class="modal-card"><button class="modal-x" onclick="closeModal()">×</button><div id="modalBody"></div></div></div>
-<div id="toast"></div>
+<div id="modal" class="modal hidden" role="dialog" aria-modal="true" aria-hidden="true"><div class="modal-card"><button class="modal-x" onclick="closeModal()" aria-label="Đóng hộp thoại">×</button><div id="modalBody"></div></div></div>
+<div id="toast" role="status" aria-live="polite"></div>
 <audio id="player" preload="auto"></audio>
 <script src="/app.js"></script>
 </body>

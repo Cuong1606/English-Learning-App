@@ -1,23 +1,30 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import hashlib
 import json
 import math
 import mimetypes
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
+import uuid
 import webbrowser
 import io
 import zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+from app_version import APP_VERSION, BACKUP_FORMAT_VERSION, USER_DB_SCHEMA_VERSION
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
@@ -35,7 +42,50 @@ USER_DIR = USER_BASE / "user_data"
 USER_DB = USER_DIR / "learning.sqlite"
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8767
-APP_VERSION = "2.4.3"
+USER_DATA_LOCK = threading.RLock()
+BACKUP_TYPE = "english-learning-app-user-data"
+MAX_BACKUP_ARCHIVE_BYTES = 16 * 1024 * 1024 * 1024
+MAX_BACKUP_UNCOMPRESSED_BYTES = 64 * 1024 * 1024 * 1024
+MAX_BACKUP_FILE_COUNT = 100000
+MAX_USER_AUDIO_FILE_BYTES = 25 * 1024 * 1024
+MAX_BACKUP_COMPRESSION_RATIO = 500
+RESTORE_DISK_MARGIN_BYTES = 512 * 1024 * 1024
+SUPPORTED_USER_AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".webm"}
+RESTORE_SHUTDOWN_CALLBACK = None
+RESTORE_SHUTDOWN_PENDING = threading.Event()
+
+USER_SETTING_DEFAULTS = {
+    "new_per_day": "20",
+    "desired_retention": "0.90",
+    "reschedule_on_retention_change": "0",
+    "recall_mode": "vi_en",
+    "shadow_speed": "1.0",
+    "shadow_repeat": "3",
+    "shadow_pause": "2",
+    "list_auto_delay": "1",
+    "active_collection_key": "core:219",
+}
+
+REQUIRED_USER_SCHEMA = {
+    "app_settings": {"key", "value"},
+    "collection_progress": {"collection_key", "last_index", "updated_at_ts"},
+    "saved_items": {"item_key", "saved_at_ts"},
+    "suspended_items": {"item_key", "suspended_at_ts"},
+    "fsrs_cards": {
+        "item_key", "state", "step", "stability", "difficulty", "due_ts",
+        "last_review_ts", "introduced_at_ts", "review_count", "lapse_count", "last_rating",
+    },
+    "review_log": {
+        "id", "item_key", "rating", "review_ts", "state_before", "state_after",
+        "due_after_ts", "stability_after", "difficulty_after", "source_mode",
+    },
+    "my_islands": {"id", "name", "description", "created_at_ts", "updated_at_ts"},
+    "my_island_members": {"id", "island_id", "order_index", "item_key"},
+    "custom_sentences": {
+        "id", "en_us", "vi_vn", "usage_note", "literal_note", "audio_file",
+        "audio_key", "audio_expected", "note", "created_at_ts", "updated_at_ts",
+    },
+}
 
 # FSRS-6 default parameters used by current Py-FSRS documentation.
 # Core scheduling math follows the open-source FSRS DSR model. Fuzzing is disabled
@@ -82,13 +132,33 @@ def content_conn():
     return con
 
 
-def user_conn():
-    USER_DIR.mkdir(parents=True, exist_ok=True)
-    USER_AUDIO.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(USER_DB, timeout=20)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA foreign_keys=ON")
+class _UserConnection(sqlite3.Connection):
+    """SQLite connection that owns the user-data lock until it is closed."""
+
+    _holds_user_data_lock = False
+
+    def close(self):
+        try:
+            super().close()
+        finally:
+            if self._holds_user_data_lock:
+                self._holds_user_data_lock = False
+                USER_DATA_LOCK.release()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
+def _initialize_user_connection(con):
+    current_version = int(con.execute("PRAGMA user_version").fetchone()[0])
+    if current_version > USER_DB_SCHEMA_VERSION:
+        raise ValueError(
+            f"Database người dùng dùng schema {current_version}, mới hơn schema "
+            f"{USER_DB_SCHEMA_VERSION} mà ứng dụng hỗ trợ"
+        )
     con.executescript(
         """
         CREATE TABLE IF NOT EXISTS app_settings (
@@ -173,20 +243,45 @@ def user_conn():
         if col not in existing_cols:
             con.execute(f"ALTER TABLE custom_sentences ADD COLUMN {col} {ddl}")
     con.execute("CREATE INDEX IF NOT EXISTS idx_custom_audio_key ON custom_sentences(audio_key)")
-    defaults = {
-        "new_per_day": "20",
-        "desired_retention": "0.90",
-        "reschedule_on_retention_change": "0",
-        "recall_mode": "vi_en",
-        "shadow_speed": "1.0",
-        "shadow_repeat": "3",
-        "shadow_pause": "2",
-        "list_auto_delay": "1",
-        "active_collection_key": "core:219",
-    }
-    for k, v in defaults.items():
+    for k, v in USER_SETTING_DEFAULTS.items():
         con.execute("INSERT OR IGNORE INTO app_settings(key,value) VALUES(?,?)", (k, v))
+    con.execute(f"PRAGMA user_version={int(USER_DB_SCHEMA_VERSION)}")
     con.commit()
+
+
+def _create_user_database(path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(path, timeout=20)
+    try:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA foreign_keys=ON")
+        _initialize_user_connection(con)
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        con.execute("PRAGMA journal_mode=DELETE").fetchone()
+    finally:
+        con.close()
+
+
+def user_conn():
+    USER_DATA_LOCK.acquire()
+    con = None
+    try:
+        USER_DIR.mkdir(parents=True, exist_ok=True)
+        USER_AUDIO.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(USER_DB, timeout=20, factory=_UserConnection)
+        con._holds_user_data_lock = True
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA foreign_keys=ON")
+        _initialize_user_connection(con)
+    except Exception:
+        if con is not None:
+            con.close()
+        else:
+            USER_DATA_LOCK.release()
+        raise
     return con
 
 
@@ -624,6 +719,9 @@ def get_bootstrap():
         progress = {r["collection_key"]: {"last_index":r["last_index"],"updated_at_ts":r["updated_at_ts"]} for r in u.execute("SELECT * FROM collection_progress")}
         return {
             "appVersion": APP_VERSION,
+            "backupFormatVersion": BACKUP_FORMAT_VERSION,
+            "userDbSchemaVersion": USER_DB_SCHEMA_VERSION,
+            "restoreResult": read_restore_result(),
             "topics": topics,
             "collections": collections,
             "courses": get_courses(c),
@@ -1609,6 +1707,625 @@ def missing_audio_my_island(island_id):
         return rows_to_dicts(u.execute("SELECT cs.audio_key,cs.en_us,cs.vi_vn,cs.audio_expected FROM my_island_members m JOIN custom_sentences cs ON m.item_key='c:'||cs.id WHERE m.island_id=? AND (cs.audio_file IS NULL OR cs.audio_file='') ORDER BY m.order_index",(int(island_id),)))
 
 
+def _user_base_dir():
+    """Derive the profile root from patchable test paths, not USER_BASE."""
+    base = Path(USER_DIR).resolve().parent
+    if Path(USER_DB).resolve().parent != Path(USER_DIR).resolve():
+        raise RuntimeError("Đường dẫn database người dùng không hợp lệ")
+    if Path(USER_AUDIO).resolve().parent != base:
+        raise RuntimeError("Đường dẫn user_audio không hợp lệ")
+    return base
+
+
+def _db_sidecars(path=None):
+    db = Path(path or USER_DB)
+    return [Path(str(db) + suffix) for suffix in ("-wal", "-shm", "-journal")]
+
+
+def _remove_db_sidecars(path=None):
+    for sidecar in _db_sidecars(path):
+        sidecar.unlink(missing_ok=True)
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _safe_user_audio_name(name):
+    name = str(name or "")
+    reserved = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+    return bool(
+        name
+        and name not in (".", "..")
+        and "/" not in name
+        and "\\" not in name
+        and not any(ch in name for ch in '<>:"|?*')
+        and all(ord(ch) >= 32 for ch in name)
+        and not name.endswith((" ", "."))
+        and Path(name).stem.upper() not in reserved
+        and Path(name).name == name
+        and Path(name).suffix.lower() in SUPPORTED_USER_AUDIO_EXTENSIONS
+    )
+
+
+def _list_user_audio_files():
+    if not USER_AUDIO.exists():
+        return []
+    files = []
+    for path in sorted(USER_AUDIO.rglob("*"), key=lambda p: p.name.casefold()):
+        if path.is_dir():
+            continue
+        rel = path.relative_to(USER_AUDIO)
+        if len(rel.parts) != 1 or not _safe_user_audio_name(rel.name):
+            raise ValueError(f"Tên file trong user_audio không hợp lệ: {rel.as_posix()}")
+        size = path.stat().st_size
+        if size > MAX_USER_AUDIO_FILE_BYTES:
+            raise ValueError(f"File user_audio vượt giới hạn 25 MB: {rel.name}")
+        files.append(path)
+    return files
+
+
+def _validate_user_database(path, expected_schema=USER_DB_SCHEMA_VERSION, audio_names=None):
+    path = Path(path)
+    try:
+        con = sqlite3.connect(f"file:{path.resolve().as_posix()}?mode=ro", uri=True, timeout=20)
+    except sqlite3.Error as exc:
+        raise ValueError(f"Không thể mở database trong bản sao lưu: {exc}") from exc
+    try:
+        con.row_factory = sqlite3.Row
+        integrity = con.execute("PRAGMA integrity_check").fetchone()
+        if not integrity or str(integrity[0]).lower() != "ok":
+            raise ValueError("Database trong bản sao lưu không vượt qua integrity_check")
+        actual_schema = int(con.execute("PRAGMA user_version").fetchone()[0])
+        if actual_schema != int(expected_schema):
+            raise ValueError(
+                f"Schema database ({actual_schema}) không khớp manifest ({expected_schema})"
+            )
+        if actual_schema > USER_DB_SCHEMA_VERSION:
+            raise ValueError(
+                f"Schema database {actual_schema} mới hơn phiên bản ứng dụng hỗ trợ "
+                f"({USER_DB_SCHEMA_VERSION})"
+            )
+        for table, required_columns in REQUIRED_USER_SCHEMA.items():
+            exists = con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            if not exists:
+                raise ValueError(f"Database thiếu bảng bắt buộc: {table}")
+            columns = {r[1] for r in con.execute(f'PRAGMA table_info("{table}")')}
+            missing = required_columns - columns
+            if missing:
+                raise ValueError(f"Bảng {table} thiếu cột: {', '.join(sorted(missing))}")
+        restored_audio = set(audio_names) if audio_names is not None else None
+        for row in con.execute(
+            "SELECT audio_file FROM custom_sentences WHERE audio_file IS NOT NULL AND audio_file<>''"
+        ):
+            name = str(row[0])
+            if not _safe_user_audio_name(name):
+                raise ValueError(f"Database chứa tên user_audio không hợp lệ: {name}")
+            if restored_audio is not None and name not in restored_audio:
+                raise ValueError(f"Bản sao lưu thiếu user_audio được database tham chiếu: {name}")
+        return {"schemaVersion": actual_schema, "integrity": "ok"}
+    except sqlite3.Error as exc:
+        raise ValueError(f"Database trong bản sao lưu bị lỗi: {exc}") from exc
+    finally:
+        con.close()
+
+
+def _backup_filename():
+    stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    return f"EnglishLearningApp-user-data-{stamp}.zip"
+
+
+def create_user_backup(output_path):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with USER_DATA_LOCK:
+        base = _user_base_dir()
+        base.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix=".backup_stage_", dir=base))
+        partial = None
+        try:
+            snapshot = work / "learning.sqlite"
+            with user_conn() as source:
+                destination = sqlite3.connect(snapshot)
+                try:
+                    source.backup(destination)
+                    destination.commit()
+                finally:
+                    destination.close()
+            audio_files = _list_user_audio_files()
+            audio_names = {p.name for p in audio_files}
+            _validate_user_database(snapshot, USER_DB_SCHEMA_VERSION, audio_names)
+            if len(audio_files) + 1 > MAX_BACKUP_FILE_COUNT:
+                raise ValueError("User data có quá nhiều file để sao lưu")
+            total_size = snapshot.stat().st_size + sum(p.stat().st_size for p in audio_files)
+            if total_size > MAX_BACKUP_UNCOMPRESSED_BYTES:
+                raise ValueError("User data vượt giới hạn an toàn 64 GB")
+            files = {
+                "user_data/learning.sqlite": {
+                    "size": snapshot.stat().st_size,
+                    "sha256": _sha256_file(snapshot),
+                }
+            }
+            for audio_path in audio_files:
+                archive_name = f"user_audio/{audio_path.name}"
+                files[archive_name] = {
+                    "size": audio_path.stat().st_size,
+                    "sha256": _sha256_file(audio_path),
+                }
+            manifest = {
+                "backupType": BACKUP_TYPE,
+                "backupFormatVersion": BACKUP_FORMAT_VERSION,
+                "appVersion": APP_VERSION,
+                "userDbSchemaVersion": USER_DB_SCHEMA_VERSION,
+                "createdAtUtc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "files": files,
+            }
+            fd, partial_name = tempfile.mkstemp(
+                prefix=f".{output_path.name}.", suffix=".partial", dir=output_path.parent
+            )
+            os.close(fd)
+            partial = Path(partial_name)
+            with zipfile.ZipFile(partial, "w", allowZip64=True) as archive:
+                archive.writestr(
+                    "manifest.json",
+                    json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
+                    compress_type=zipfile.ZIP_DEFLATED,
+                )
+                archive.write(snapshot, "user_data/learning.sqlite", compress_type=zipfile.ZIP_DEFLATED)
+                for audio_path in audio_files:
+                    archive.write(
+                        audio_path,
+                        f"user_audio/{audio_path.name}",
+                        compress_type=zipfile.ZIP_STORED,
+                    )
+            if partial.stat().st_size > MAX_BACKUP_ARCHIVE_BYTES:
+                raise ValueError("File backup vượt giới hạn an toàn 16 GB")
+            os.replace(partial, output_path)
+            partial = None
+            return {
+                "ok": True,
+                "path": str(output_path),
+                "filename": output_path.name,
+                "fileCount": len(files),
+                "size": output_path.stat().st_size,
+                "manifest": manifest,
+            }
+        finally:
+            if partial is not None:
+                partial.unlink(missing_ok=True)
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def _validated_zip_member(info):
+    name = str(info.filename or "")
+    if not name or "\\" in name or name.startswith("/"):
+        raise ValueError(f"Đường dẫn trong ZIP không hợp lệ: {name or '(trống)'}")
+    pure = PurePosixPath(name)
+    if pure.is_absolute() or any(part in ("", ".", "..") for part in pure.parts):
+        raise ValueError(f"Phát hiện ZIP path traversal: {name}")
+    if len(pure.parts) == 1:
+        if name != "manifest.json":
+            raise ValueError(f"File không được hỗ trợ trong ZIP: {name}")
+    elif tuple(pure.parts) == ("user_data", "learning.sqlite"):
+        pass
+    elif len(pure.parts) == 2 and pure.parts[0] == "user_audio" and _safe_user_audio_name(pure.parts[1]):
+        pass
+    else:
+        raise ValueError(f"Đường dẫn không được hỗ trợ trong ZIP: {name}")
+    unix_mode = (info.external_attr >> 16) & 0o170000
+    if unix_mode == 0o120000:
+        raise ValueError(f"ZIP không được chứa symbolic link: {name}")
+    if info.flag_bits & 0x1:
+        raise ValueError("ZIP được mã hóa không được hỗ trợ")
+    return name
+
+
+def _profile_size_bytes():
+    total = 0
+    for path in [USER_DB, *_db_sidecars()]:
+        if Path(path).exists() and Path(path).is_file():
+            total += Path(path).stat().st_size
+    if USER_AUDIO.exists():
+        total += sum(path.stat().st_size for path in USER_AUDIO.rglob("*") if path.is_file())
+    return total
+
+
+def _ensure_restore_disk_capacity(base, incoming_uncompressed, incoming_archive_size):
+    # During prepare we temporarily hold the uploaded ZIP, both extracted profiles,
+    # a safety ZIP, and SQLite's snapshot workspace. Keep a fixed operating margin.
+    current_size = _profile_size_bytes()
+    required = (
+        int(incoming_uncompressed)
+        + current_size * 2
+        + RESTORE_DISK_MARGIN_BYTES
+    )
+    free = shutil.disk_usage(Path(base)).free
+    if free < required:
+        raise ValueError(
+            "Không đủ dung lượng trống để khôi phục an toàn. "
+            f"Cần khoảng {required / (1024 ** 3):.1f} GB, hiện còn {free / (1024 ** 3):.1f} GB."
+        )
+
+
+def _extract_and_validate_backup(archive_path, stage, check_disk=True):
+    archive_path = Path(archive_path)
+    archive_size = archive_path.stat().st_size
+    if archive_size <= 0:
+        raise ValueError("File backup trống")
+    if archive_size > MAX_BACKUP_ARCHIVE_BYTES:
+        raise ValueError("File backup vượt giới hạn an toàn 16 GB")
+    stage = Path(stage)
+    stage.mkdir(parents=True, exist_ok=True)
+    try:
+        archive = zipfile.ZipFile(archive_path, "r")
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise ValueError("File backup không phải ZIP hợp lệ") from exc
+    with archive:
+        infos = archive.infolist()
+        if len(infos) > MAX_BACKUP_FILE_COUNT + 1:
+            raise ValueError("File backup chứa quá nhiều file")
+        names = set()
+        casefolded_names = set()
+        total_size = 0
+        total_compressed = 0
+        for info in infos:
+            if info.is_dir():
+                raise ValueError("ZIP backup không được chứa directory entry rời")
+            name = _validated_zip_member(info)
+            if name in names:
+                raise ValueError(f"ZIP chứa file trùng tên: {name}")
+            if name.casefold() in casefolded_names:
+                raise ValueError(f"ZIP chứa tên file xung đột trên Windows: {name}")
+            names.add(name)
+            casefolded_names.add(name.casefold())
+            total_size += int(info.file_size)
+            total_compressed += int(info.compress_size)
+            if total_size > MAX_BACKUP_UNCOMPRESSED_BYTES:
+                raise ValueError("Dữ liệu giải nén vượt giới hạn an toàn 64 GB")
+            if (
+                info.file_size > 100 * 1024 * 1024
+                and info.file_size > max(1, info.compress_size) * MAX_BACKUP_COMPRESSION_RATIO
+            ):
+                raise ValueError(f"Tỷ lệ nén bất thường, có thể là ZIP bomb: {name}")
+            if name.startswith("user_audio/") and info.file_size > MAX_USER_AUDIO_FILE_BYTES:
+                raise ValueError(f"File user_audio vượt giới hạn 25 MB: {name}")
+        if total_size > max(1, total_compressed) * MAX_BACKUP_COMPRESSION_RATIO:
+            raise ValueError("Tỷ lệ nén tổng thể bất thường, có thể là ZIP bomb")
+        if check_disk:
+            _ensure_restore_disk_capacity(_user_base_dir(), total_size, archive_size)
+        required = {"manifest.json", "user_data/learning.sqlite"}
+        if not required <= names:
+            raise ValueError("Backup thiếu manifest.json hoặc learning.sqlite")
+        if archive.getinfo("manifest.json").file_size > 1024 * 1024:
+            raise ValueError("Manifest vượt giới hạn 1 MB")
+        try:
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+        except Exception as exc:
+            raise ValueError("Manifest không phải JSON UTF-8 hợp lệ") from exc
+        if manifest.get("backupType") != BACKUP_TYPE:
+            raise ValueError("File ZIP không phải backup của English Learning App")
+        if not isinstance(manifest.get("appVersion"), str) or not manifest.get("appVersion"):
+            raise ValueError("Manifest thiếu appVersion")
+        if not isinstance(manifest.get("createdAtUtc"), str) or not manifest.get("createdAtUtc"):
+            raise ValueError("Manifest thiếu thời điểm tạo backup")
+        if int(manifest.get("backupFormatVersion", -1)) != BACKUP_FORMAT_VERSION:
+            raise ValueError(
+                f"Backup format {manifest.get('backupFormatVersion')} không được hỗ trợ; "
+                f"ứng dụng hỗ trợ format {BACKUP_FORMAT_VERSION}"
+            )
+        manifest_schema = int(manifest.get("userDbSchemaVersion", -1))
+        if manifest_schema < 1 or manifest_schema > USER_DB_SCHEMA_VERSION:
+            raise ValueError(
+                f"User database schema {manifest_schema} không tương thích với schema "
+                f"{USER_DB_SCHEMA_VERSION}"
+            )
+        files = manifest.get("files")
+        if not isinstance(files, dict):
+            raise ValueError("Manifest thiếu danh sách checksum")
+        expected_files = names - {"manifest.json"}
+        if set(files) != expected_files:
+            raise ValueError("Danh sách file trong manifest không khớp nội dung ZIP")
+        for info in infos:
+            if info.filename == "manifest.json":
+                continue
+            target = stage.joinpath(*PurePosixPath(info.filename).parts)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(info, "r") as source, target.open("wb") as destination:
+                shutil.copyfileobj(source, destination, 1024 * 1024)
+            meta = files.get(info.filename)
+            if not isinstance(meta, dict):
+                raise ValueError(f"Manifest không hợp lệ cho {info.filename}")
+            if int(meta.get("size", -1)) != target.stat().st_size:
+                raise ValueError(f"Sai kích thước file backup: {info.filename}")
+            if str(meta.get("sha256", "")).lower() != _sha256_file(target):
+                raise ValueError(f"Checksum không khớp: {info.filename}")
+        audio_dir = stage / "user_audio"
+        audio_dir.mkdir(parents=True, exist_ok=True)
+        audio_names = {p.name for p in audio_dir.iterdir() if p.is_file()}
+        _validate_user_database(
+            stage / "user_data" / "learning.sqlite", manifest_schema, audio_names
+        )
+        return manifest
+
+
+def _checkpoint_user_database():
+    with user_conn() as con:
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+
+
+def _install_user_profile(staged_db, staged_audio, work_root, after_install=None):
+    staged_db = Path(staged_db)
+    staged_audio = Path(staged_audio)
+    work_root = Path(work_root)
+    rollback_db = work_root / "rollback-learning.sqlite"
+    rollback_audio = work_root / "rollback-user_audio"
+    old_db_moved = False
+    old_audio_moved = False
+    installed = False
+    _user_base_dir()
+    USER_DIR.mkdir(parents=True, exist_ok=True)
+    staged_audio.mkdir(parents=True, exist_ok=True)
+    try:
+        _checkpoint_user_database()
+        _remove_db_sidecars()
+        if USER_DB.exists():
+            os.replace(USER_DB, rollback_db)
+            old_db_moved = True
+        if USER_AUDIO.exists():
+            os.replace(USER_AUDIO, rollback_audio)
+            old_audio_moved = True
+        os.replace(staged_db, USER_DB)
+        os.replace(staged_audio, USER_AUDIO)
+        with user_conn() as con:
+            if str(con.execute("PRAGMA integrity_check").fetchone()[0]).lower() != "ok":
+                raise RuntimeError("Database mới không vượt qua integrity_check sau khi cài đặt")
+        if after_install is not None:
+            after_install()
+        installed = True
+    except Exception as original_error:
+        rollback_error = None
+        try:
+            _remove_db_sidecars()
+            if USER_DB.exists():
+                USER_DB.unlink()
+            if USER_AUDIO.exists():
+                shutil.rmtree(USER_AUDIO)
+            if old_db_moved and rollback_db.exists():
+                os.replace(rollback_db, USER_DB)
+            if old_audio_moved and rollback_audio.exists():
+                os.replace(rollback_audio, USER_AUDIO)
+            else:
+                USER_AUDIO.mkdir(parents=True, exist_ok=True)
+            with user_conn() as con:
+                if str(con.execute("PRAGMA integrity_check").fetchone()[0]).lower() != "ok":
+                    raise RuntimeError("Database cũ bị lỗi sau rollback")
+        except Exception as exc:
+            rollback_error = exc
+        if rollback_error is not None:
+            raise RuntimeError(
+                f"Cài đặt dữ liệu mới thất bại ({original_error}); rollback cũng thất bại ({rollback_error})"
+            ) from original_error
+        raise
+    finally:
+        if installed:
+            rollback_db.unlink(missing_ok=True)
+            if rollback_audio.exists():
+                shutil.rmtree(rollback_audio, ignore_errors=True)
+
+
+def reset_learning_progress():
+    tables = ("collection_progress", "fsrs_cards", "review_log", "suspended_items")
+    with USER_DATA_LOCK, user_conn() as con:
+        before = {table: con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in tables}
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            for table in tables:
+                con.execute(f"DELETE FROM {table}")
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
+    return {"ok": True, "deleted": before}
+
+
+def delete_all_user_data(after_install=None):
+    with USER_DATA_LOCK:
+        base = _user_base_dir()
+        base.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix=".delete_all_stage_", dir=base))
+        try:
+            staged_db = work / "fresh" / "learning.sqlite"
+            staged_audio = work / "fresh_audio"
+            staged_audio.mkdir(parents=True)
+            _create_user_database(staged_db)
+            _validate_user_database(staged_db, USER_DB_SCHEMA_VERSION, set())
+            _install_user_profile(staged_db, staged_audio, work, after_install=after_install)
+            return {"ok": True, "schemaVersion": USER_DB_SCHEMA_VERSION}
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def configure_restore_lifecycle(shutdown_callback):
+    global RESTORE_SHUTDOWN_CALLBACK
+    RESTORE_SHUTDOWN_CALLBACK = shutdown_callback
+
+
+def _restore_root():
+    root = _user_base_dir() / "restore_pending"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _restore_result_file():
+    return _user_base_dir() / "restore_result.json"
+
+
+def read_restore_result():
+    path = _restore_result_file()
+    if not path.exists():
+        return None
+    try:
+        result = json.loads(path.read_text(encoding="utf-8"))
+        return result if isinstance(result, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def acknowledge_restore_result():
+    _restore_result_file().unlink(missing_ok=True)
+    return {"ok": True}
+
+
+def _assert_no_pending_restore(except_dir=None):
+    root = _restore_root()
+    for marker in root.glob("*/pending.json"):
+        if except_dir is None or marker.parent.resolve() != Path(except_dir).resolve():
+            raise RuntimeError("Ứng dụng đang tự hoàn tất phiên khôi phục trước")
+
+
+def pending_restore_markers():
+    root = _restore_root()
+    return sorted(root.glob("*/pending.json"), key=lambda path: path.stat().st_mtime)
+
+
+def pending_restore_session_status():
+    markers = pending_restore_markers()
+    if not markers:
+        return None
+    return {"pendingFile": str(markers[0]), "count": len(markers)}
+
+
+def complete_pending_restore_if_needed(lock_timeout=5.0):
+    """Finish one validated restore synchronously before opening the user DB.
+
+    Restore is deliberately completed on the next manual app launch. This
+    avoids a background copy of English Learning App.exe waiting on itself or
+    on SQLite/WAL handles after the window has closed.
+    """
+    markers = pending_restore_markers()
+    if not markers:
+        return None
+    if len(markers) != 1:
+        raise RuntimeError("Có nhiều phiên khôi phục chưa hoàn tất; cần kiểm tra restore_pending")
+    from restore_helper import apply_pending_restore
+    return apply_pending_restore(
+        markers[0], wait_pid=0, process_timeout=0.01, lock_timeout=max(0.01, float(lock_timeout))
+    )
+
+
+def new_restore_staging():
+    _assert_no_pending_restore()
+    return _restore_root() / uuid.uuid4().hex
+
+
+def prepare_user_restore(archive_path, pending_dir=None):
+    """Validate ZIP + safety snapshot and persist a helper-readable pending restore."""
+    with USER_DATA_LOCK:
+        base = _user_base_dir()
+        base.mkdir(parents=True, exist_ok=True)
+        pending = Path(pending_dir or new_restore_staging()).resolve()
+        if pending.parent != _restore_root().resolve():
+            raise ValueError("Thư mục staging restore không hợp lệ")
+        _assert_no_pending_restore(except_dir=pending)
+        pending.mkdir(parents=True, exist_ok=False) if not pending.exists() else None
+        try:
+            incoming = pending / "incoming.zip"
+            source = Path(archive_path).resolve()
+            if source != incoming.resolve():
+                shutil.copy2(source, incoming)
+
+            incoming_profile = pending / "incoming_profile"
+            manifest = _extract_and_validate_backup(incoming, incoming_profile)
+
+            safety_archive = pending / "safety-snapshot.zip"
+            create_user_backup(safety_archive)
+            safety_profile = pending / "safety_profile"
+            _extract_and_validate_backup(safety_archive, safety_profile, check_disk=False)
+
+            config = {
+                "createdAt": time.time(),
+                "incomingDb": str((incoming_profile / "user_data" / "learning.sqlite").resolve()),
+                "incomingAudio": str((incoming_profile / "user_audio").resolve()),
+                "safetyDb": str((safety_profile / "user_data" / "learning.sqlite").resolve()),
+                "safetyAudio": str((safety_profile / "user_audio").resolve()),
+                "safetyArchive": str(safety_archive.resolve()),
+                "targetDb": str(Path(USER_DB).resolve()),
+                "targetAudio": str(Path(USER_AUDIO).resolve()),
+                "resultFile": str(_restore_result_file().resolve()),
+                "schemaVersion": USER_DB_SCHEMA_VERSION,
+                "restoredAppVersion": manifest.get("appVersion"),
+                "backupFormatVersion": manifest.get("backupFormatVersion"),
+            }
+            partial = pending / "pending.json.partial"
+            partial.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(partial, pending / "pending.json")
+            state_partial = pending / "restore_state.json.partial"
+            state_partial.write_text(
+                json.dumps(
+                    {"status": "prepared", "createdAt": time.time(), "updatedAt": time.time()},
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            os.replace(state_partial, pending / "restore_state.json")
+            return {
+                "ok": True,
+                "accepted": True,
+                "closing": True,
+                "pendingFile": str((pending / "pending.json").resolve()),
+                "restoredAppVersion": manifest.get("appVersion"),
+                "backupFormatVersion": manifest.get("backupFormatVersion"),
+                "schemaVersion": manifest.get("userDbSchemaVersion"),
+                "safetySnapshotCreated": True,
+            }
+        except Exception:
+            shutil.rmtree(pending, ignore_errors=True)
+            raise
+
+
+def _restore_helper_command(pending_file):
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--restore-helper", "--pending", str(pending_file), "--wait-pid", str(os.getpid())]
+    return [sys.executable, str(ROOT / "restore_helper.py"), "--pending", str(pending_file), "--wait-pid", str(os.getpid())]
+
+
+def launch_pending_restore(pending_file):
+    pending_file = Path(pending_file).resolve()
+    if not pending_file.exists():
+        raise ValueError("Pending restore không tồn tại")
+    kwargs = {"cwd": str(ROOT)}
+    if os.name == "nt":
+        kwargs["creationflags"] = 0x08000000
+        kwargs["close_fds"] = True
+    try:
+        subprocess.Popen(_restore_helper_command(pending_file), **kwargs)
+    except Exception:
+        raise
+    return {"ok": True, "accepted": True, "closing": True}
+
+
+def open_user_data_folder(opener=None, platform_name=None):
+    platform_name = os.name if platform_name is None else platform_name
+    if platform_name != "nt":
+        raise ValueError("Chức năng này chỉ hỗ trợ Windows")
+    base = _user_base_dir()
+    base.mkdir(parents=True, exist_ok=True)
+    if opener is None:
+        opener = os.startfile
+    opener(str(base))
+    return {"ok": True, "path": str(base)}
+
+
 def bulk_audio_course(course_key, zip_data):
     if course_key != "common_phrases": raise ValueError("Course này không hỗ trợ import audio")
     raw=decode_base64_blob(zip_data, 300*1024*1024, "ZIP audio")
@@ -1673,10 +2390,72 @@ class Handler(BaseHTTPRequestHandler):
                 if not chunk: break
                 self.wfile.write(chunk)
 
+    def _send_user_backup(self):
+        base = _user_base_dir()
+        base.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix=".backup_download_", dir=base))
+        try:
+            output = work / _backup_filename()
+            create_user_backup(output)
+            return self.send_file(output, cache=False, download_name=output.name)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    def _receive_restore_zip(self):
+        if RESTORE_SHUTDOWN_CALLBACK is None:
+            raise RuntimeError("Restore chỉ khả dụng khi ứng dụng có thể tự đóng hoàn toàn")
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type not in ("application/zip", "application/octet-stream"):
+            raise ValueError("Hãy chọn trực tiếp file backup ZIP")
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError as exc:
+            raise ValueError("Kích thước file backup không hợp lệ") from exc
+        if length <= 0:
+            raise ValueError("File backup trống")
+        if length > MAX_BACKUP_ARCHIVE_BYTES:
+            raise ValueError("File backup vượt giới hạn an toàn 16 GB")
+        base = _user_base_dir()
+        free = shutil.disk_usage(base).free
+        if free < length + RESTORE_DISK_MARGIN_BYTES:
+            raise ValueError("Không đủ dung lượng trống để nhận và kiểm tra file backup")
+
+        pending = new_restore_staging()
+        pending.mkdir(parents=True)
+        incoming = pending / "incoming.zip"
+        remaining = length
+        try:
+            with incoming.open("wb") as output:
+                while remaining:
+                    chunk = self.rfile.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise ValueError("File backup tải lên bị thiếu dữ liệu")
+                    output.write(chunk)
+                    remaining -= len(chunk)
+            prepared = prepare_user_restore(incoming, pending_dir=pending)
+            # Do not spawn a background helper here. The validated restore is
+            # completed synchronously on the next manual app launch, before any
+            # user database connection/server is opened.
+            RESTORE_SHUTDOWN_PENDING.set()
+            response = {key: value for key, value in prepared.items() if key != "pendingFile"}
+            self.send_json(response, 202)
+            timer = threading.Timer(1.5, RESTORE_SHUTDOWN_CALLBACK)
+            timer.daemon = True
+            timer.start()
+            return None
+        except Exception:
+            shutil.rmtree(pending, ignore_errors=True)
+            raise
+
     def do_GET(self):
+        with USER_DATA_LOCK:
+            return self._do_GET()
+
+    def _do_GET(self):
         parsed=urllib.parse.urlparse(self.path); path=parsed.path; qs=urllib.parse.parse_qs(parsed.query)
         try:
             if path=="/api/bootstrap": return self.send_json(get_bootstrap())
+            if path=="/api/data/backup": return self._send_user_backup()
             if path=="/api/srs/info":
                 item=(qs.get("item_key") or [None])[0]; col=(qs.get("collection_key") or [None])[0]; group=(qs.get("group_key") or [None])[0]
                 return self.send_json(get_srs_info(item,col,group))
@@ -1710,9 +2489,25 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"error":str(e)},400)
 
     def do_POST(self):
+        path=urllib.parse.urlparse(self.path).path
+        if path=="/api/data/restore":
+            try:
+                return self._receive_restore_zip()
+            except Exception as e:
+                return self.send_json({"error":str(e)},400)
+        if RESTORE_SHUTDOWN_PENDING.is_set():
+            return self.send_json({"error":"Ứng dụng đang đóng để khôi phục dữ liệu"},503)
+        with USER_DATA_LOCK:
+            return self._do_POST()
+
+    def _do_POST(self):
         parsed=urllib.parse.urlparse(self.path)
         try:
             data=self.read_json(); path=parsed.path
+            if path=="/api/data/reset-progress": return self.send_json(reset_learning_progress())
+            if path=="/api/data/delete-all": return self.send_json(delete_all_user_data())
+            if path=="/api/data/restore-result/ack": return self.send_json(acknowledge_restore_result())
+            if path=="/api/data/open-folder": return self.send_json(open_user_data_folder())
             if path=="/api/review": return self.send_json(apply_review(data.get("item_key"),int(data.get("rating",0)),data.get("source_mode","active_recall")))
             if path=="/api/srs/manage": return self.send_json(manage_srs(data.get("action"),data.get("item_key"),data.get("collection_key"),data.get("group_key")))
             if path=="/api/bookmark": return self.send_json(bookmark_item(data.get("item_key"),data.get("saved") if "saved" in data else None))
@@ -1738,8 +2533,14 @@ def main():
     ap=argparse.ArgumentParser(); ap.add_argument("--port",type=int,default=DEFAULT_PORT); ap.add_argument("--no-browser",action="store_true"); args=ap.parse_args()
     if not CONTENT_DB.exists(): print(f"Missing database: {CONTENT_DB}"); sys.exit(1)
     if not AUDIO.exists(): print(f"Missing audio folder: {AUDIO}"); sys.exit(1)
+    configure_restore_lifecycle(None)
+    restore_result = complete_pending_restore_if_needed(lock_timeout=5.0)
+    if restore_result and not restore_result.get("ok") and not restore_result.get("rollbackOk", True):
+        print("Khôi phục và rollback đều thất bại; không mở app để tránh dùng profile không an toàn.")
+        return
     user_conn().close()
     httpd=ThreadingHTTPServer((HOST,args.port),Handler); url=f"http://{HOST}:{args.port}"
+    configure_restore_lifecycle(httpd.shutdown)
     print("="*64); print(f" ENGLISH LOCAL APP V{APP_VERSION}"); print(f" Open: {url}"); print(" Learn List - Courses - Shadowing - Active Recall - FSRS - My Islands"); print(" Close app: press Ctrl+C in this window"); print("="*64)
     if not args.no_browser: threading.Thread(target=lambda:(time.sleep(1),webbrowser.open(url)),daemon=True).start()
     try: httpd.serve_forever()
