@@ -1,0 +1,45 @@
+SRS/FSRS MANAGEMENT CHANGE - LOCAL TEST REPORT
+==============================================
+
+Scope implemented
+- Per sentence: Review now / Reset to New / Suspend-Resume / SRS info.
+- Per collection: Island / Vocabulary set / Unit / My Island bulk actions.
+- 4000 Essential English Words: whole Course and per Book bulk actions.
+- Canonical sentence dedupe for bulk actions.
+- Suspended sentences excluded from Daily Study, including unscheduled New sentences.
+- Review now changes due time only; preserves FSRS state, stability, difficulty and history.
+- Reset deletes current FSRS card state and returns it to New; review_log is preserved.
+- Suspension is preserved across Reset, and Resume restores the existing schedule when a card still has one.
+- Desired Retention remains default 0.90.
+- New setting: Reschedule existing cards on retention change, default OFF.
+- With reschedule ON, only long-term Review due dates are recomputed; Learning/Relearning steps are untouched.
+- In-app How to Learn guide and README_VI updated.
+
+Local checks
+- Python syntax: PASS
+- JavaScript syntax (node --check): PASS
+- content.sqlite PRAGMA integrity_check: ok
+- content sentence count: 16,090 (unchanged)
+- HTTP smoke: bootstrap / SRS collection info / SRS course info / static index+app.js: PASS
+- Regression tests: 13/13 groups PASS
+  * FSRS first steps
+  * 1,000 random reference sequences
+  * retention direction
+  * lapse/relearning
+  * Daily queue + global canonical card
+  * Auto Next setting validation
+  * fresh-install directory creation
+  * Review now + Reset preservation
+  * Suspend/Resume exclusion from Daily Study
+  * bulk collection canonical dedupe
+  * retention reschedule OFF/ON + Learning untouched
+  * Course/Book bulk scope
+  * existing user DB migration preservation
+
+Windows validation still required
+- Run full tests on the real Windows workspace.
+- Validate migration against a copy of an existing %LOCALAPPDATA%\EnglishLocal user database.
+- Open the packaged EXE and visually inspect Learn/Unit/My Island/Courses/Settings/How to Learn.
+- Exercise Review now / Reset / Suspend-Resume on one disposable test sentence and one disposable collection scope.
+- Re-test XLSX download after rebuild.
+- Build English Learning App.exe and report SHA-256.

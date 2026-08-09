@@ -1,0 +1,31 @@
+# Build outputs and Python environments
+dist/
+build/
+.build_env/
+.venv/
+venv/
+
+# Python caches
+**/__pycache__/
+*.py[cod]
+
+# Large bundled audio (distributed separately in the Windows release asset)
+audio/
+course_audio/
+
+# Archives and previous build/backup artifacts
+*.zip
+
+# Local user data and temporary test profiles
+.srs_*
+EnglishLocal/
+user_data/
+local_data/
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.log
+
+# OS metadata
+Thumbs.db
+.DS_Store

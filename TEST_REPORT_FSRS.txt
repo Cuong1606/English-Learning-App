@@ -1,0 +1,28 @@
+V2.4 - FSRS / REVIEW REGRESSION TEST REPORT
+================================
+
+Core scheduler: FSRS-6, default 21 parameters, desired retention configurable, fuzzing OFF.
+Learning steps: 1 minute, 10 minutes.
+Relearning step: 10 minutes.
+
+Automated regression tests passed:
+1. First-review transitions for Again / Hard / Good / Easy.
+2. 1000 randomized review histories compared against an independent reference implementation of the published Py-FSRS scheduling formulas/state transitions.
+3. Desired-retention direction: higher retention never produces a longer interval for the same stability.
+4. Review -> Again -> Relearning, Hard/Good relearning transitions, lapse counter.
+5. Daily Study queue: due cards first, new-card limit, no duplicate item keys, one global SRS card per sentence.
+6. Auto-next delay setting validation.
+
+Important V2.2 fix:
+- V2.1 requeued only Again and could show it before its actual learning/relearning due time.
+- V2.2 queues every Learning/Relearning continuation (Again/Hard/Good when applicable) with its real due timestamp and never shows it early. If the current session ends first, the card remains scheduled and appears in Review when due.
+
+Data checks:
+- SQLite integrity: OK
+- Original core/vocabulary regression data retained: 11,638 sentence records
+- 54 Islands + 20 Vocabulary collections retained
+- Original 11,638 MP3 files retained; course audio is checked separately in TEST_REPORT_V2_4.txt
+- Membership orphan records: 0
+- Python syntax: OK
+- JavaScript syntax: OK
+- HTTP smoke test: bootstrap 200, index 200, audio Range 206

@@ -1,0 +1,80 @@
+ENGLISH LEARNING APP V2.4.2 - FINAL QA
+=======================================
+Ngày kiểm tra: 2026-08-09
+
+AUDIO MỚI
+- common_phrases_audio.zip: 789 MP3, 789 tên file duy nhất.
+- Đã ghép vào Common English Phrases.
+- Common English Phrases: 852/852 audio.
+
+DỮ LIỆU
+- SQLite quick_check: OK
+- Sentence content: 16.090
+- Memberships: 17.531
+- Collections: 255
+- Topics: 8
+- Câu English/Vietnamese trống: 0
+- Collection sai sentence_count: 0
+- Membership mồ côi: 0
+- 4000 Essential English Words: 6 Books x 30 Units x 20 câu = 3.600 câu
+- Common English Phrases: 852 câu
+
+AUDIO
+- Bộ chính: 11.638 MP3
+- Courses: 4.452 MP3
+- Tổng: 16.090 MP3
+- File thiếu: 0
+- File 0 byte: 0
+- MP3 lỗi cấu trúc: 0
+- Thời lượng: 0,504s đến 9,012s; trung bình ~2,216s
+
+FSRS / REVIEW
+- 6/6 nhóm regression test PASS.
+- 1.000 chuỗi review ngẫu nhiên khớp scheduler tham chiếu của app.
+- Learning/Relearning chỉ xuất hiện lại khi đến due.
+- SRS toàn cục theo canonical sentence; không tạo lịch trùng giữa các collection.
+- Daily Study / giới hạn câu mới / lapse-relearning: PASS.
+
+API / CHỨC NĂNG
+- Bootstrap/static assets: PASS
+- Core / Essential4000 / Common Phrases collection: PASS
+- Audio HTTP Range 206: PASS
+- Search English + Vietnamese: PASS
+- XLSX template: PASS
+- Tạo My Island + import XLSX: PASS
+- Bulk Audio: PASS
+- Saved + Review: PASS
+- Settings validation: PASS
+- Chặn path traversal: PASS
+
+UI / LAYOUT
+- Home / Learn / Vocabulary / Courses / Review / My Islands / Saved / Search / Guide / Settings: PASS
+- Vocabulary đúng nhóm A1/A2/B1/B2/C1/Khác.
+- Courses hiển thị 6 Books và Common Phrases 852/852 audio.
+- Unit list 20 câu: PASS
+- Auto Next ON/OFF + delay: PASS
+- Bottom audio player không còn phóng toàn màn hình: PASS
+- Shadowing controls: PASS
+- Active Recall reveal + rating: PASS
+- Search UI: PASS
+- Guide có Import XLSX & Bulk Audio: PASS
+- Layout 1440px và 900px: PASS
+- JavaScript page errors / console errors trong harness: 0
+
+LỖI PHÁT HIỆN VÀ ĐÃ SỬA TRONG V2.4.2
+1. newToday có thể đếm sai với câu Course alias canonical -> đã sửa.
+2. Bulk Audio có thể dùng cùng một MP3 cho hai câu khi Audio Key trùng -> đã chặn xung đột.
+3. Duplicate Audio Key khi import XLSX chưa đổi audio_expected tương ứng -> đã sửa.
+4. Launcher có thể nối nhầm server V2.4.x cũ -> chỉ nhận đúng appVersion 2.4.2.
+5. Setting số thực có thể nhận NaN -> đã chặn giá trị không hữu hạn.
+6. Đường dẫn backup Windows hiển thị/escape chưa chuẩn -> đã sửa.
+7. Sau khi audio Common Phrases đủ 852/852, route/nút tải gói TTS cũ trở thành thừa -> đã loại bỏ.
+
+CODE
+- node --check web/app.js: PASS
+- Python py_compile server.py / launcher.pyw / scheduler tests: PASS
+
+GIỚI HẠN KIỂM TRA
+- Môi trường QA là Linux container. Logic launcher, file BAT/VBS và cấu trúc shortcut đã được kiểm tra tĩnh,
+  nhưng không thể chạy end-to-end Windows Explorer/Edge như trên máy Windows thật.
+- Vì vậy bước cuối người dùng vẫn cần mở app trên Windows để xác nhận launcher/icon trong môi trường máy thực.

@@ -1,0 +1,37 @@
+ENGLISH LEARNING APP V2.4 - BUILD / QA REPORT
+==============================================
+
+CORE LEARNING
+- Learn List / Shadowing / Active Recall / FSRS Review retained.
+- FSRS regression: 6/6 test groups PASS.
+- Daily vs Free Study logic retained: only Active Recall ratings update SRS.
+
+CONTENT
+- Original library: 11,638 sentence records, 54 Islands, 20 Vocabulary collections.
+- 4000 Essential English Words: 3,600 sentences, 6 Books, 30 Units/Book, 20 sentences/Unit.
+- Essential English audio: 3,600/3,600 present.
+- Common English Phrases: 852 sentences; Vietnamese translation rebuilt from English.
+- Common Phrases Charon audio reused: 63/852; remaining 789 have a bundled Charon generator package.
+- Total sentence records in static library: 16,090.
+- Total static collections: 255 (74 original + 180 Essential units + 1 Common Phrases).
+- Total memberships: 17,531.
+
+MY ISLAND IMPORT
+- XLSX parser tested with Audio Key / English / Vietnamese / Audio file / Note.
+- XLSX bulk import tested.
+- Bulk Audio ZIP matching tested.
+- Bulk Audio folder matching tested.
+- Missing-audio report tested.
+- Template download endpoint tested.
+
+COURSES / AUDIO
+- Course audio endpoint HTTP 200 tested.
+- Byte Range HTTP 206 tested.
+- Common Phrases bulk-audio endpoint tested.
+- Charon package download endpoint tested.
+
+INTEGRITY
+- SQLite PRAGMA integrity_check: ok.
+- Python syntax: PASS.
+- JavaScript syntax: PASS.
+- HTTP bootstrap/collection/template/audio smoke tests: PASS.

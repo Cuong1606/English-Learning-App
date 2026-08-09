@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>English Learning App V2.4.3</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<div id="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">E</div>
+      <div><b>English Local</b><small>Learn · Recall · Review</small></div>
+    </div>
+    <nav>
+      <button class="nav active" data-view="home"><span>⌂</span><b>Home</b></button>
+      <button class="nav" data-view="learn"><span>▤</span><b>Learn</b></button>
+      <button class="nav" data-view="vocabulary"><span>ABC</span><b>Vocabulary</b></button>
+      <button class="nav" data-view="courses"><span>▦</span><b>Courses</b></button>
+      <button class="nav" data-view="review"><span>↻</span><b>Review</b><em id="dueBadge"></em></button>
+      <button class="nav" data-view="my"><span>＋</span><b>My Islands</b></button>
+      <button class="nav" data-view="saved"><span>🔖</span><b>Saved</b></button>
+      <button class="nav" data-view="search"><span>⌕</span><b>Search</b></button>
+      <button class="nav" data-view="guide"><span>?</span><b>How to Learn</b></button>
+      <button class="nav" data-view="settings"><span>⚙</span><b>Settings</b></button>
+    </nav>
+    <div class="sidebar-foot"><b>Offline</b><br>No login · Local data</div>
+  </aside>
+  <main class="app-main">
+    <header class="topbar">
+      <div><h1 id="pageTitle">Home</h1><p id="pageSub">Learn → Shadowing → Active Recall → FSRS Review</p></div>
+      <div class="top-actions"><span class="pill">🔊 Charon</span><span class="pill">FSRS</span></div>
+    </header>
+    <section id="content"></section>
+  </main>
+</div>
+<div id="bottomPlayer" class="bottom-player hidden"></div>
+<div id="modal" class="modal hidden"><div class="modal-card"><button class="modal-x" onclick="closeModal()">×</button><div id="modalBody"></div></div></div>
+<div id="toast"></div>
+<audio id="player" preload="auto"></audio>
+<script src="/app.js"></script>
+</body>
+</html>
