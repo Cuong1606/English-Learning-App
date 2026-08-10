@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -108,7 +109,7 @@ def wait_app(profile_base, previous_pid=None, timeout=60):
         if runtime and runtime.get("pid") != previous_pid and pid_alive(runtime.get("pid")):
             try:
                 boot = http_json(runtime["port"], "/api/bootstrap", timeout=2)
-                if boot.get("appVersion") == "1.1.0":
+                if boot.get("appVersion") == "1.2.0":
                     return runtime, boot
             except Exception as exc:
                 last = exc
@@ -254,6 +255,74 @@ def create_custom(port, island_id, english, audio_bytes):
     })
 
 
+def exercise_english_by_topic(port, boot, report):
+    courses = boot.get("courses") or []
+    assert_true(
+        [course.get("name") for course in courses] == [
+            "4000 Essential English Words",
+            "Common English Phrases",
+            "English by Topic",
+        ],
+        f"Packaged Courses mismatch: {courses}",
+    )
+    topic = next(course for course in courses if course.get("key") == "english_by_topic")
+    assert_true(len(topic.get("units") or []) == 30, "English by Topic unit count mismatch")
+    assert_true(topic.get("sentence_count") == 990, "English by Topic sentence count mismatch")
+    assert_true(topic.get("audio_available") == 990 and topic.get("audio_missing") == 0, "English by Topic audio total mismatch")
+
+    expected_units = {
+        800: ("U1 · Family", "Gia đình", 20),
+        814: ("U15 · Directions", "Chỉ đường", 36),
+        829: ("U30 · Wedding", "Đám cưới", 39),
+    }
+    opened = {}
+    for collection_id, (name, description, count) in expected_units.items():
+        collection = http_json(port, f"/api/collection?kind=core&id={collection_id}")
+        opened[collection_id] = collection
+        assert_true(collection["collection"]["name"] == name, f"Collection name mismatch: {collection_id}")
+        assert_true(collection["collection"]["description"] == description, f"Collection topic mismatch: {collection_id}")
+        assert_true(len(collection["items"]) == count, f"Collection count mismatch: {collection_id}")
+        for index in (0, len(collection["items"]) // 2, len(collection["items"]) - 1):
+            item = collection["items"][index]
+            status, _headers, audio = http_raw(port, item["audio"])
+            assert_true(status == 200 and len(audio) > 100, f"English by Topic audio failed: {collection_id}/{index}")
+
+    status, _headers, app_js = http_raw(port, "/app.js")
+    assert_true(status == 200, "Packaged app.js unavailable")
+    for marker in (b"function renderShadowTab", b"function renderRecallSetup", b"english_by_topic"):
+        assert_true(marker in app_js, f"Packaged learning UI marker missing: {marker!r}")
+
+    first = opened[800]["items"][0]
+    assert_true(http_json(port, "/api/bookmark", {"item_key": first["item_key"], "saved": True})["saved"], "Saved failed")
+    saved = http_json(port, "/api/saved")["items"]
+    assert_true(any(item["item_key"] == first["item_key"] for item in saved), "Saved item not returned")
+    review = http_json(port, "/api/review", {"item_key": first["item_key"], "rating": 3, "source_mode": "active_recall"})
+    assert_true(review.get("ok") and review.get("item_key") == first["item_key"], "Active Recall/FSRS review failed")
+
+    item_query = urllib.parse.quote(first["item_key"], safe="")
+    item_srs = http_json(port, f"/api/srs/info?item_key={item_query}")
+    assert_true(item_srs.get("review_count") == 1, "Single-item SRS info mismatch")
+    assert_true(http_json(port, "/api/srs/manage", {"action": "review_now", "item_key": first["item_key"]})["affected"] == 1, "Single-item SRS action failed")
+
+    unit_srs = http_json(port, "/api/srs/info?collection_key=core%3A814")
+    assert_true(unit_srs.get("total") == 36, "Unit SRS scope mismatch")
+    assert_true(http_json(port, "/api/srs/manage", {"action": "suspend", "collection_key": "core:814"})["affected"] == 36, "Unit SRS suspend failed")
+    assert_true(http_json(port, "/api/srs/manage", {"action": "resume", "collection_key": "core:814"})["affected"] == 36, "Unit SRS resume failed")
+
+    course_srs = http_json(port, "/api/srs/info?group_key=course%3Aenglish_by_topic")
+    assert_true(course_srs.get("total") == 990, "Course SRS scope mismatch")
+    assert_true(http_json(port, "/api/srs/manage", {"action": "suspend", "group_key": "course:english_by_topic"})["affected"] == 990, "Course SRS suspend failed")
+    assert_true(http_json(port, "/api/srs/manage", {"action": "resume", "group_key": "course:english_by_topic"})["affected"] == 990, "Course SRS resume failed")
+
+    search = http_json(port, "/api/search?q=Thanksgiving")
+    assert_true(any(item.get("en_us") == "My whole family gets together for Thanksgiving." for item in search.get("items", [])), "Search did not find English by Topic")
+
+    http_json(port, "/api/bookmark", {"item_key": first["item_key"], "saved": False})
+    report["checks"].append("Packaged Courses: 3 courses; English by Topic 30 Units / 990 sentences / 990 audio")
+    report["checks"].append("U1/U15/U30 metadata and first/middle/last audio")
+    report["checks"].append("Learn/Shadowing/Active Recall, Saved, item/Unit/Course SRS, and Search")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--exe", required=True)
@@ -296,6 +365,10 @@ def main(argv=None):
         initial, runtime, boot = open_app_manually(exe, env, profile_base, previous_pid=runtime["pid"])
         app_pids.append(runtime["pid"])
         port = runtime["port"]
+
+        assert_true(boot.get("appVersion") == "1.2.0", "About/bootstrap version mismatch")
+        exercise_english_by_topic(port, boot, report)
+        report["checks"].append("About/bootstrap version 1.2.0")
 
         first_collection = next(c for c in boot["collections"] if int(c.get("sentence_count") or 0) > 0)
         collection = http_json(port, f"/api/collection?kind=core&id={first_collection['id']}")

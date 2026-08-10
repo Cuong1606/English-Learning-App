@@ -15,6 +15,7 @@ course_audio/
 
 # Archives and previous build/backup artifacts
 *.zip
+*.bak
 
 # Local user data and temporary test profiles
 .srs_*

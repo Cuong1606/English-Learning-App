@@ -654,9 +654,29 @@ def get_courses(c):
             fp = (COURSE_AUDIO / rel).resolve()
             if COURSE_AUDIO.resolve() in fp.parents and fp.exists() and fp.is_file():
                 available += 1
+    topic_units = [x for x in rows if x.get("source_group") == "course:english_by_topic"]
+    topic_units.sort(key=lambda x: int(x["id"]))
+    topic_audio_available = 0
+    for r in c.execute(
+        """
+        SELECT ca.audio_path
+        FROM content_membership m
+        JOIN collections co ON co.id=m.island_id
+        JOIN content_audio ca ON ca.content_id=m.content_id
+        WHERE co.source_group=?
+        ORDER BY co.id,m.order_index,m.sentence_id
+        """,
+        ("course:english_by_topic",),
+    ):
+        rel = str(r[0]).replace("\\", "/").lstrip("/")
+        fp = (COURSE_AUDIO / rel).resolve()
+        if COURSE_AUDIO.resolve() in fp.parents and fp.exists() and fp.is_file():
+            topic_audio_available += 1
+    topic_sentence_count = sum(int(x.get("sentence_count") or 0) for x in topic_units)
     return [
         {"key":"essential4000","name":"4000 Essential English Words","sentence_count":sum(x["sentence_count"] for x in books),"books":books,"audio_available":3600,"audio_missing":0},
         {"key":"common_phrases","name":"Common English Phrases","sentence_count":total,"collection":phrase,"audio_available":available,"audio_missing":max(0,total-available)},
+        {"key":"english_by_topic","name":"English by Topic","sentence_count":topic_sentence_count,"units":topic_units,"audio_available":topic_audio_available,"audio_missing":max(0,topic_sentence_count-topic_audio_available)},
     ]
 
 
@@ -1058,6 +1078,12 @@ def _group_item_keys(group_key, c, u):
             "SELECT m.content_id FROM content_membership m JOIN collections co ON co.id=m.island_id WHERE co.source_group LIKE 'course:essential4000:%' ORDER BY co.id,m.order_index,m.sentence_id"
         )
         return list(dict.fromkeys(item_key_for_content(r[0], c) for r in rows))
+    if group_key == "course:english_by_topic":
+        rows = c.execute(
+            "SELECT m.content_id FROM content_membership m JOIN collections co ON co.id=m.island_id WHERE co.source_group=? ORDER BY co.id,m.order_index,m.sentence_id",
+            ("course:english_by_topic",),
+        )
+        return list(dict.fromkeys(item_key_for_content(r[0], c) for r in rows))
     m = re.fullmatch(r"book:essential4000:([1-6])", group_key)
     if m:
         source_group = f"course:essential4000:book{int(m.group(1))}"
@@ -1072,6 +1098,8 @@ def _group_item_keys(group_key, c, u):
 def _group_name(group_key):
     if group_key == "course:essential4000":
         return "4000 Essential English Words"
+    if group_key == "course:english_by_topic":
+        return "English by Topic"
     m = re.fullmatch(r"book:essential4000:([1-6])", str(group_key or ""))
     if m:
         return f"4000 Essential English Words · Book {int(m.group(1))}"
