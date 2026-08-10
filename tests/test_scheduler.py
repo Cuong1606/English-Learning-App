@@ -366,6 +366,96 @@ def test_course_and_book_bulk_scope():
     finally:
         _restore_user_env(tmp,old)
 
+
+def test_english_by_topic_content_runtime_saved_and_srs():
+    expected_units={800:("U1 · Family",20),814:("U15 · Directions",36),829:("U30 · Wedding",39)}
+    expected_aliases={
+        30156:20086,
+        30290:1012,
+        30318:24018,
+        30484:1687,
+        30672:2903,
+    }
+    with sv.content_conn() as c:
+        courses={course['key']:course for course in sv.get_courses(c)}
+        topic=courses['english_by_topic']
+        assert len(topic['units'])==30
+        assert topic['sentence_count']==990
+        assert topic['audio_available']==990 and topic['audio_missing']==0
+        assert c.execute("SELECT COUNT(*) FROM content_membership WHERE source_group='course:english_by_topic'").fetchone()[0]==990
+        assert c.execute("SELECT COUNT(*) FROM content_audio WHERE audio_path LIKE 'english_by_topic/%'").fetchone()[0]==990
+        assert c.execute("SELECT COUNT(*) FROM sentence_content WHERE content_id BETWEEN 30001 AND 30990 AND instr(en_us,'/')>0").fetchone()[0]==135
+        aliases={r[0]:r[1] for r in c.execute("SELECT content_id,canonical_content_id FROM srs_alias WHERE content_id BETWEEN 30001 AND 30990")}
+        assert aliases==expected_aliases
+        assert c.execute("SELECT COUNT(*) FROM sentence_content s LEFT JOIN srs_alias a ON a.content_id=s.content_id WHERE s.content_id BETWEEN 30001 AND 30990 AND a.content_id IS NULL").fetchone()[0]==985
+
+    tmp,old=_temp_user_env('english_by_topic_runtime_test_')
+    try:
+        opened={}
+        for collection_id,(name,count) in expected_units.items():
+            collection=sv.get_core_collection(collection_id)
+            opened[collection_id]=collection
+            assert collection['collection']['name']==name
+            assert len(collection['items'])==count
+            assert all(item['en_us'] and item['vi_vn'] for item in collection['items'])
+            assert all(str(item['audio']).startswith('/course-audio/english_by_topic/') for item in collection['items'])
+
+        # Learn, Shadowing, and Active Recall consume this same complete item payload.
+        first=opened[800]['items'][0]
+        assert {'en_us','vi_vn','audio','item_key'}<=set(first)
+        saved=sv.bookmark_item(first['item_key'],True)
+        assert saved['saved'] is True
+        saved_items=sv.get_saved_items()
+        assert len(saved_items)==1 and saved_items[0]['item_key']==first['item_key']
+        review=sv.apply_review(first['item_key'],3,'active_recall')
+        assert review['ok'] and review['item_key']==first['item_key']
+        refreshed=sv.get_core_collection(800)
+        assert refreshed['items'][0]['saved'] is True
+        assert refreshed['items'][0]['srs'] is not None
+
+        unit=sv.get_srs_info(collection_key_value='core:814')
+        course=sv.get_srs_info(group_key='course:english_by_topic')
+        assert unit['total']==36 and course['total']==990
+        assert sv.manage_srs('suspend',collection_key_value='core:814')['affected']==36
+        assert sv.get_srs_info(group_key='course:english_by_topic')['counts']['suspended']==36
+        assert sv.manage_srs('resume',group_key='course:english_by_topic')['affected']==36
+        assert sv.manage_srs('suspend',group_key='course:english_by_topic')['affected']==990
+        assert sv.manage_srs('resume',group_key='course:english_by_topic')['affected']==990
+    finally:
+        _restore_user_env(tmp,old)
+
+
+def test_english_by_topic_import_rolls_back_atomically():
+    importer_spec=importlib.util.spec_from_file_location('english_by_topic_importer',ROOT/'scripts'/'import_english_by_topic.py')
+    importer=importlib.util.module_from_spec(importer_spec)
+    importer_spec.loader.exec_module(importer)
+    tmp=Path(tempfile.mkdtemp(prefix='english_by_topic_rollback_test_'))
+    database=tmp/'content.sqlite'
+    try:
+        shutil.copy2(sv.CONTENT_DB,database)
+        with sqlite3.connect(database) as c:
+            c.execute('DELETE FROM srs_alias WHERE content_id BETWEEN 30001 AND 30990')
+            c.execute("DELETE FROM content_audio WHERE audio_path LIKE 'english_by_topic/%'")
+            c.execute("DELETE FROM content_membership WHERE source_group='course:english_by_topic'")
+            c.execute('DELETE FROM sentence_content WHERE content_id BETWEEN 30001 AND 30990')
+            c.execute("DELETE FROM collections WHERE source_group='course:english_by_topic'")
+            c.execute("CREATE TRIGGER force_topic_import_failure BEFORE INSERT ON sentence_content WHEN NEW.content_id=30500 BEGIN SELECT RAISE(ABORT,'forced rollback test'); END")
+        rows,topics,_manifest,_audio=importer.read_package(ROOT/'English_by_Topic_U1-U30_app_package.zip')
+        try:
+            importer.import_database(database,rows,topics)
+            raise AssertionError('forced import failure did not occur')
+        except sqlite3.IntegrityError as exc:
+            assert 'forced rollback test' in str(exc)
+        with sqlite3.connect(f'file:{database}?mode=ro',uri=True) as c:
+            assert c.execute("SELECT COUNT(*) FROM collections WHERE source_group='course:english_by_topic'").fetchone()[0]==0
+            assert c.execute("SELECT COUNT(*) FROM content_membership WHERE source_group='course:english_by_topic'").fetchone()[0]==0
+            assert c.execute('SELECT COUNT(*) FROM sentence_content WHERE content_id BETWEEN 30001 AND 30990').fetchone()[0]==0
+            assert c.execute("SELECT COUNT(*) FROM content_audio WHERE audio_path LIKE 'english_by_topic/%'").fetchone()[0]==0
+            assert c.execute('SELECT COUNT(*) FROM srs_alias WHERE content_id BETWEEN 30001 AND 30990').fetchone()[0]==0
+            assert c.execute('PRAGMA integrity_check').fetchone()[0]=='ok'
+    finally:
+        shutil.rmtree(tmp,ignore_errors=True)
+
 def test_user_db_migration_adds_srs_management_without_losing_existing_settings():
     tmp=Path(tempfile.mkdtemp(prefix='english_migration_test_'))
     old=(sv.USER_DIR,sv.USER_DB,sv.USER_AUDIO)
@@ -388,7 +478,7 @@ def test_user_db_migration_adds_srs_management_without_losing_existing_settings(
         shutil.rmtree(tmp,ignore_errors=True)
 
 def run_all():
-    tests=[test_first_steps,test_reference_random_sequences,test_retention_direction,test_lapse_relearning,test_daily_queue_and_global_card,test_auto_delay_setting_validation,test_user_conn_creates_missing_parent_directories,test_review_now_and_reset_preserve_memory_and_history,test_suspend_resume_excluded_from_daily_for_new_and_due_cards,test_bulk_collection_uses_unique_canonical_keys,test_retention_reschedule_off_on_and_learning_untouched,test_course_and_book_bulk_scope,test_user_db_migration_adds_srs_management_without_losing_existing_settings]
+    tests=[test_first_steps,test_reference_random_sequences,test_retention_direction,test_lapse_relearning,test_daily_queue_and_global_card,test_auto_delay_setting_validation,test_user_conn_creates_missing_parent_directories,test_review_now_and_reset_preserve_memory_and_history,test_suspend_resume_excluded_from_daily_for_new_and_due_cards,test_bulk_collection_uses_unique_canonical_keys,test_retention_reschedule_off_on_and_learning_untouched,test_course_and_book_bulk_scope,test_english_by_topic_content_runtime_saved_and_srs,test_english_by_topic_import_rolls_back_atomically,test_user_db_migration_adds_srs_management_without_losing_existing_settings]
     for fn in tests:
         fn(); print('PASS',fn.__name__)
     print(f'PASS ALL: {len(tests)} test groups')

@@ -1,4 +1,4 @@
-ENGLISH LEARNING APP V1.1.0 - DONG GOI WINDOWS
+ENGLISH LEARNING APP V1.2.0 - DONG GOI WINDOWS
 
 MUC TIEU
 - Tao app Windows co cua so rieng.
@@ -7,7 +7,7 @@ MUC TIEU
 - App van chay local/offline; du lieu hoc ca nhan nam trong LocalAppData\EnglishLocal.
 
 CACH LAM
-1. Chep cac file nay vao THU MUC GOC cua app V1.1.0 dang chay tot:
+1. Chep cac file nay vao THU MUC GOC cua app V1.2.0 dang chay tot:
    app_version.py
    desktop_app.py
    restore_helper.py
@@ -30,7 +30,7 @@ CACH LAM
    dist\English Learning App\English Learning App.exe
 
 LUU Y
-- Build theo kieu ONEDIR de 16.090 MP3 khong bi giai nen lai moi lan mo app.
+- Build theo kieu ONEDIR de 17.080 MP3 khong bi giai nen lai moi lan mo app.
 - Khong can start_app.bat sau khi da build.
 - Khong can mo Chrome.
 - Windows can Microsoft Edge WebView2 Runtime. Windows 10/11 thong thuong da co san.

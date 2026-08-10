@@ -1,4 +1,4 @@
-ENGLISH LEARNING APP V1.1.0
+ENGLISH LEARNING APP V1.2.0
 ===========================
 
 MỞ APP
@@ -15,6 +15,7 @@ NỘI DUNG
 - Courses:
   + 4000 Essential English Words: 6 Books / 180 Units / 3.600 câu / 3.600 audio
   + Common English Phrases: 852 câu / 852 audio Charon
+  + English by Topic: 30 Units / 990 câu / 990 audio
 - My Islands: tạo tay hoặc import XLSX + Bulk Audio theo Audio Key
 
 IMPORT XLSX / BULK AUDIO
@@ -32,7 +33,7 @@ HỌC & ÔN TẬP
 - Chỉ Active Recall có chấm điểm mới cập nhật lịch FSRS.
 - Daily Study ưu tiên câu đến hạn; Free Study không tự thay đổi SRS nếu chỉ đọc/nghe.
 - Mỗi câu có menu Ôn tập: Ôn lại ngay / Reset về Chưa học / Tạm dừng-Tiếp tục / Thông tin SRS.
-- Mỗi Island, Unit, My Island và Course 4000 Essential có thao tác ôn tập hàng loạt; câu canonical trùng chỉ xử lý một lần.
+- Mỗi Island, Unit, My Island và Course có thao tác ôn tập hàng loạt; câu canonical trùng chỉ xử lý một lần.
 - Reset về Chưa học giữ lại review history; Tạm dừng loại câu khỏi Daily Study nhưng giữ lịch FSRS để tiếp tục sau.
 - Settings > FSRS: Desired Retention mặc định 90%; Reschedule existing cards mặc định OFF.
 
@@ -46,6 +47,11 @@ Cập nhật app không làm mất tiến độ, My Islands hoặc lịch SRS n�
 YÊU CẦU
 - Windows có Python 3.
 - Microsoft Edge hoặc Google Chrome.
+
+V1.2.0
+- Thêm English by Topic: 30 Units / 990 câu / 990 audio.
+- Dùng chung Learn / Shadowing / Active Recall / FSRS / Saved và ôn tập hàng loạt theo Unit hoặc toàn Course.
+- Tổng tài nguyên bundled audio: 17.080 MP3.
 
 V1.1.0
 - Chỉ mở bằng start_app.bat.
