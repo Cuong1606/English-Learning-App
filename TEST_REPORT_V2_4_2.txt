@@ -20,9 +20,8 @@ DỮ LIỆU
 - Common English Phrases: 852 câu
 
 AUDIO
-- Bộ chính: 11.638 MP3
-- Courses: 4.452 MP3
-- Tổng: 16.090 MP3
+- Số lượng dưới đây thuộc snapshot QA lịch sử và không còn là nguồn chân lý.
+- Với checkout hiện tại, chạy scripts/audit_audio_assets.py để đếm trực tiếp.
 - File thiếu: 0
 - File 0 byte: 0
 - MP3 lỗi cấu trúc: 0

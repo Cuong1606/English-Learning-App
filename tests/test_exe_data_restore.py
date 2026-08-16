@@ -109,7 +109,7 @@ def wait_app(profile_base, previous_pid=None, timeout=60):
         if runtime and runtime.get("pid") != previous_pid and pid_alive(runtime.get("pid")):
             try:
                 boot = http_json(runtime["port"], "/api/bootstrap", timeout=2)
-                if boot.get("appVersion") == "1.2.0":
+                if boot.get("appVersion") == "1.3.0":
                     return runtime, boot
             except Exception as exc:
                 last = exc
@@ -137,7 +137,11 @@ def close_window_with_x(pid, timeout=10):
             owner = ctypes.c_uint32()
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
             if owner.value == int(pid) and user32.IsWindowVisible(hwnd):
-                windows.append(hwnd)
+                length = user32.GetWindowTextLengthW(hwnd)
+                title = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, title, length + 1)
+                if title.value == "English Learning App":
+                    windows.append(hwnd)
             return True
 
         user32.EnumWindows(callback, 0)
@@ -289,7 +293,7 @@ def exercise_english_by_topic(port, boot, report):
 
     status, _headers, app_js = http_raw(port, "/app.js")
     assert_true(status == 200, "Packaged app.js unavailable")
-    for marker in (b"function renderShadowTab", b"function renderRecallSetup", b"english_by_topic"):
+    for marker in (b"function renderShadowTab", b"function renderRecallSetup", b"function courseCard", b"function openCourse"):
         assert_true(marker in app_js, f"Packaged learning UI marker missing: {marker!r}")
 
     first = opened[800]["items"][0]
@@ -366,9 +370,9 @@ def main(argv=None):
         app_pids.append(runtime["pid"])
         port = runtime["port"]
 
-        assert_true(boot.get("appVersion") == "1.2.0", "About/bootstrap version mismatch")
+        assert_true(boot.get("appVersion") == "1.3.0", "About/bootstrap version mismatch")
         exercise_english_by_topic(port, boot, report)
-        report["checks"].append("About/bootstrap version 1.2.0")
+        report["checks"].append("About/bootstrap version 1.3.0")
 
         first_collection = next(c for c in boot["collections"] if int(c.get("sentence_count") or 0) > 0)
         collection = http_json(port, f"/api/collection?kind=core&id={first_collection['id']}")

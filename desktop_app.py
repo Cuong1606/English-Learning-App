@@ -39,6 +39,27 @@ class DesktopApi:
         result = server.create_user_backup(output)
         return {"ok": True, "path": result["path"], "filename": result["filename"]}
 
+    def pick_bulk_audio(self, scope, target, mode):
+        """Select a ZIP/folder natively and stage it without exposing paths to JS."""
+        window = webview.windows[0] if webview.windows else None
+        if window is None:
+            return {"ok": False, "error": "Cửa sổ ứng dụng chưa sẵn sàng"}
+        try:
+            if mode == "folder":
+                paths = window.create_file_dialog(webview.FileDialog.FOLDER)
+            else:
+                paths = window.create_file_dialog(
+                    webview.FileDialog.OPEN,
+                    allow_multiple=False,
+                    file_types=("ZIP audio (*.zip)",),
+                )
+            if not paths:
+                return {"ok": False, "cancelled": True}
+            selected = paths[0] if not isinstance(paths, str) else paths
+            return server.prepare_bulk_audio_path(str(scope), str(target), selected, str(mode))
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
 
 def show_message(text, title=APP_TITLE, flags=0x40):
     if os.name == "nt":
@@ -86,6 +107,7 @@ def main():
     mutex = ensure_single_instance()
     httpd = None
     server_thread = None
+    app_shutdown_complete = threading.Event()
     try:
         validate_resources()
         server.configure_restore_lifecycle(None)
@@ -99,10 +121,13 @@ def main():
                 flags=0x10,
             )
             return 1
+        server.cleanup_orphan_bulk_audio_staging()
         server.user_conn().close()
 
         # Port 0 lets Windows choose an available local port automatically.
         httpd = server.ThreadingHTTPServer((server.HOST, 0), server.Handler)
+        httpd.daemon_threads = True
+        httpd.block_on_close = False
         port = int(httpd.server_address[1])
         url = f"http://{server.HOST}:{port}"
         runtime_file = server._user_base_dir() / "runtime.json"
@@ -114,6 +139,36 @@ def main():
         os.replace(runtime_partial, runtime_file)
 
         restore_shutdown_started = threading.Event()
+        http_shutdown_started = threading.Event()
+
+        def shutdown_http_once():
+            if http_shutdown_started.is_set():
+                return
+            http_shutdown_started.set()
+            httpd.shutdown()
+
+        window_close_started = threading.Event()
+
+        def request_window_shutdown():
+            if window_close_started.is_set():
+                return
+            window_close_started.set()
+
+            def close_worker():
+                try:
+                    shutdown_http_once()
+                finally:
+                    if app_shutdown_complete.wait(6):
+                        return
+                    try:
+                        info = json.loads(runtime_file.read_text(encoding="utf-8")) if runtime_file.exists() else {}
+                        if int(info.get("pid", -1)) == os.getpid():
+                            runtime_file.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    os._exit(0)
+
+            threading.Thread(target=close_worker, name="WindowCloseShutdown", daemon=True).start()
 
         def request_restore_shutdown():
             if restore_shutdown_started.is_set():
@@ -128,7 +183,7 @@ def main():
 
             threading.Thread(target=force_exit_watchdog, name="RestoreExitWatchdog", daemon=True).start()
             try:
-                httpd.shutdown()
+                shutdown_http_once()
             finally:
                 for window in list(webview.windows):
                     try:
@@ -142,7 +197,7 @@ def main():
         server_thread.start()
 
         webview.settings["ALLOW_DOWNLOADS"] = True
-        webview.create_window(
+        window = webview.create_window(
             APP_TITLE,
             url,
             js_api=DesktopApi(),
@@ -152,6 +207,44 @@ def main():
             resizable=True,
             background_color="#f8fafc",
         )
+        # Stop the local server as soon as the native window closes. Waiting for
+        # webview.start() to unwind first can leave an invisible process briefly.
+        window.events.closing += request_window_shutdown
+        window.events.closed += request_window_shutdown
+
+        if os.name == "nt":
+            def monitor_native_window_lifetime():
+                user32 = ctypes.windll.user32
+                callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+                seen_visible = False
+                missing_checks = 0
+                while not window_close_started.is_set():
+                    visible = []
+
+                    @callback_type
+                    def enum_window(hwnd, _lparam):
+                        owner = ctypes.c_uint32()
+                        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+                        if owner.value == os.getpid() and user32.IsWindowVisible(hwnd):
+                            length = user32.GetWindowTextLengthW(hwnd)
+                            title = ctypes.create_unicode_buffer(length + 1)
+                            user32.GetWindowTextW(hwnd, title, length + 1)
+                            if title.value == APP_TITLE:
+                                visible.append(hwnd)
+                        return True
+
+                    user32.EnumWindows(enum_window, 0)
+                    if visible:
+                        seen_visible = True
+                        missing_checks = 0
+                    elif seen_visible:
+                        missing_checks += 1
+                        if missing_checks >= 3:
+                            request_window_shutdown()
+                            return
+                    time.sleep(0.2)
+
+            threading.Thread(target=monitor_native_window_lifetime, name="NativeWindowMonitor", daemon=True).start()
         # Force the modern Edge/WebView2 engine. This prevents silent fallback to IE/MSHTML.
         webview.start(gui="edgechromium", debug=False)
         return 0
@@ -187,6 +280,7 @@ def main():
             pass
         # Keep mutex alive until the application exits.
         _ = mutex
+        app_shutdown_complete.set()
 
 
 if __name__ == "__main__":

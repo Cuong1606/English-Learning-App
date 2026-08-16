@@ -25,6 +25,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 
 from app_version import APP_VERSION, BACKUP_FORMAT_VERSION, USER_DB_SCHEMA_VERSION
+from audio_index import BUNDLED_AUDIO_INDEX
+from bulk_audio import ALLOWED_AUDIO_EXTENSIONS, BULK_AUDIO_SESSIONS
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
@@ -33,6 +35,7 @@ COURSE_AUDIO = ROOT / "course_audio"
 TEMPLATE_XLSX = ROOT / "templates" / "mau_import_my_island.xlsx"
 CONTENT_DB = ROOT / "data" / "content.sqlite"
 ORDER_FILE = ROOT / "data" / "collection_order.json"
+COURSE_CATALOG_FILE = ROOT / "data" / "course_catalog.json"
 if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
     USER_BASE = Path(os.environ["LOCALAPPDATA"]) / "EnglishLocal"
 else:
@@ -307,6 +310,17 @@ def load_order_meta():
 ORDER_META = load_order_meta()
 
 
+def load_course_catalog():
+    try:
+        catalog = json.loads(COURSE_CATALOG_FILE.read_text(encoding="utf-8"))
+        return catalog if isinstance(catalog, list) else []
+    except Exception:
+        return []
+
+
+COURSE_CATALOG = load_course_catalog()
+
+
 def rows_to_dicts(rows):
     return [dict(r) for r in rows]
 
@@ -358,11 +372,11 @@ def audio_url_for(content_id, c=None):
         if r:
             rel = str(r[0]).replace("\\", "/").lstrip("/")
             path = (COURSE_AUDIO / rel).resolve()
-            if COURSE_AUDIO.resolve() in path.parents and path.exists() and path.is_file():
+            if COURSE_AUDIO.resolve() in path.parents and BUNDLED_AUDIO_INDEX.has_course(rel, AUDIO, COURSE_AUDIO):
                 return "/course-audio/" + urllib.parse.quote(rel, safe="/")
             return None
-        legacy = AUDIO / f"{int(content_id):06d}.mp3"
-        return f"/audio/{int(content_id):06d}.mp3" if legacy.exists() else None
+        filename = f"{int(content_id):06d}.mp3"
+        return f"/audio/{filename}" if BUNDLED_AUDIO_INDEX.has_core(filename, AUDIO, COURSE_AUDIO) else None
     finally:
         if own:
             c.close()
@@ -370,6 +384,17 @@ def audio_url_for(content_id, c=None):
 
 def item_key_custom(custom_id):
     return f"c:{int(custom_id)}"
+
+
+def user_audio_url(filename):
+    """User audio stays live (not cached) because users can restore/replace it at runtime."""
+    name = str(filename or "")
+    if not re.fullmatch(r"custom_\d{6}\.(mp3|wav|m4a|aac|ogg|webm)", name, re.I):
+        return None
+    path = (USER_AUDIO / name).resolve()
+    if path.parent != USER_AUDIO.resolve() or not path.is_file():
+        return None
+    return f"/user-audio/{name}"
 
 
 def parse_item_key(key):
@@ -424,7 +449,7 @@ def get_custom_item(custom_id, u=None):
             "content_id": None,
             "custom_id": int(custom_id),
             "is_custom": True,
-            "audio": f"/user-audio/{d['audio_file']}" if d.get("audio_file") else None,
+            "audio": user_audio_url(d.get("audio_file")),
         })
         return d
     finally:
@@ -635,49 +660,108 @@ def source_items(collection_key_value, unscheduled_only=False, limit=None):
     return items
 
 
+def _course_rows_match(rows, match):
+    mode = str((match or {}).get("type") or "exact")
+    value = str((match or {}).get("value") or "")
+    if mode == "prefix":
+        return [x for x in rows if str(x.get("source_group") or "").startswith(value)]
+    return [x for x in rows if str(x.get("source_group") or "") == value]
+
+
+def _course_audio_counts(c, collections):
+    ids = [int(x["id"]) for x in collections]
+    if not ids:
+        return 0, 0
+    placeholders = ",".join("?" for _ in ids)
+    paths = {
+        str(r[0]).replace("\\", "/").lstrip("/")
+        for r in c.execute(
+            f"SELECT DISTINCT ca.audio_path FROM content_membership m "
+            f"JOIN content_audio ca ON ca.content_id=m.content_id WHERE m.island_id IN ({placeholders})",
+            ids,
+        )
+    }
+    available = BUNDLED_AUDIO_INDEX.count_course(paths, AUDIO, COURSE_AUDIO)
+    total = sum(int(x.get("sentence_count") or 0) for x in collections)
+    return available, max(0, total - available)
+
+
 def get_courses(c):
     rows = rows_to_dicts(c.execute(
         "SELECT id,topic_id,topic_name,source_group,name,description,category,difficulty_level,sentence_count,is_vocabulary FROM collections WHERE source_group LIKE 'course:%' ORDER BY id"
     ))
-    essential = [x for x in rows if str(x.get("source_group") or "").startswith("course:essential4000:")]
-    books = []
-    for b in range(1, 7):
-        units = [x for x in essential if x.get("source_group") == f"course:essential4000:book{b}"]
-        units.sort(key=lambda x: int(x["id"]))
-        books.append({"book": b, "sentence_count": sum(int(x.get("sentence_count") or 0) for x in units), "units": units})
-    phrase = next((x for x in rows if x.get("source_group") == "course:common_phrases"), None)
-    available = 0
-    total = int(phrase.get("sentence_count") or 0) if phrase else 0
-    if phrase:
-        for r in c.execute("SELECT ca.audio_path FROM content_membership m JOIN content_audio ca ON ca.content_id=m.content_id WHERE m.island_id=? ORDER BY m.order_index", (int(phrase["id"]),)):
-            rel = str(r[0]).replace("\\", "/").lstrip("/")
-            fp = (COURSE_AUDIO / rel).resolve()
-            if COURSE_AUDIO.resolve() in fp.parents and fp.exists() and fp.is_file():
-                available += 1
-    topic_units = [x for x in rows if x.get("source_group") == "course:english_by_topic"]
-    topic_units.sort(key=lambda x: int(x["id"]))
-    topic_audio_available = 0
-    for r in c.execute(
-        """
-        SELECT ca.audio_path
-        FROM content_membership m
-        JOIN collections co ON co.id=m.island_id
-        JOIN content_audio ca ON ca.content_id=m.content_id
-        WHERE co.source_group=?
-        ORDER BY co.id,m.order_index,m.sentence_id
-        """,
-        ("course:english_by_topic",),
-    ):
-        rel = str(r[0]).replace("\\", "/").lstrip("/")
-        fp = (COURSE_AUDIO / rel).resolve()
-        if COURSE_AUDIO.resolve() in fp.parents and fp.exists() and fp.is_file():
-            topic_audio_available += 1
-    topic_sentence_count = sum(int(x.get("sentence_count") or 0) for x in topic_units)
-    return [
-        {"key":"essential4000","name":"4000 Essential English Words","sentence_count":sum(x["sentence_count"] for x in books),"books":books,"audio_available":3600,"audio_missing":0},
-        {"key":"common_phrases","name":"Common English Phrases","sentence_count":total,"collection":phrase,"audio_available":available,"audio_missing":max(0,total-available)},
-        {"key":"english_by_topic","name":"English by Topic","sentence_count":topic_sentence_count,"units":topic_units,"audio_available":topic_audio_available,"audio_missing":max(0,topic_sentence_count-topic_audio_available)},
-    ]
+    courses = []
+    for meta in COURSE_CATALOG:
+        collections = _course_rows_match(rows, meta.get("match"))
+        collections.sort(key=lambda x: int(x["id"]))
+        if not collections:
+            continue
+        available, missing = _course_audio_counts(c, collections)
+        course = {
+            "key": str(meta.get("key") or ""),
+            "name": str(meta.get("name") or "Course"),
+            "description": str(meta.get("description") or ""),
+            "layout": str(meta.get("layout") or "units"),
+            "group_key": meta.get("group_key"),
+            "audio_import": bool(meta.get("audio_import")),
+            "sentence_count": sum(int(x.get("sentence_count") or 0) for x in collections),
+            "audio_available": available,
+            "audio_missing": missing,
+            "collections": collections,
+            "sections": [],
+        }
+        if course["layout"] == "books":
+            grouped = {}
+            for collection in collections:
+                match = re.search(r":book(\d+)$", str(collection.get("source_group") or ""))
+                number = int(match.group(1)) if match else 0
+                grouped.setdefault(number, []).append(collection)
+            course["sections"] = [
+                {
+                    "key": f"book-{number}",
+                    "name": f"Book {number}",
+                    "group_key": f"book:{course['key']}:{number}",
+                    "sentence_count": sum(int(x.get("sentence_count") or 0) for x in units),
+                    "collections": units,
+                }
+                for number, units in sorted(grouped.items())
+            ]
+            course["books"] = [
+                {"book": int(section["key"].split("-", 1)[1]), "sentence_count": section["sentence_count"], "units": section["collections"]}
+                for section in course["sections"]
+            ]
+        elif course["layout"] == "collection":
+            course["collection"] = collections[0]
+        else:
+            course["sections"] = [{
+                "key": "units",
+                "name": f"{len(collections)} Units",
+                "group_key": course.get("group_key"),
+                "sentence_count": course["sentence_count"],
+                "collections": collections,
+            }]
+            course["units"] = collections
+        courses.append(course)
+    return courses
+
+
+def active_source_or_fallback(c, u):
+    stored_key = setting_get(u, "active_collection_key", USER_SETTING_DEFAULTS["active_collection_key"])
+    source = collection_summary_from_key(stored_key, c, u)
+    if source:
+        return stored_key, source
+    fallback_key = USER_SETTING_DEFAULTS["active_collection_key"]
+    source = collection_summary_from_key(fallback_key, c, u)
+    if not source:
+        _, collections = ordered_collections(c)
+        fallback = next((x for x in collections if not str(x.get("source_group") or "").startswith("course:")), None)
+        if not fallback:
+            return stored_key, None
+        fallback_key = collection_key("core", fallback["id"])
+        source = collection_summary_from_key(fallback_key, c, u)
+    setting_set(u, "active_collection_key", fallback_key)
+    u.commit()
+    return fallback_key, source
 
 
 def get_bootstrap():
@@ -703,8 +787,8 @@ def get_bootstrap():
         reviewed_today = u.execute("SELECT COUNT(*) FROM review_log WHERE review_ts>=? AND review_ts<?", (b0,b1)).fetchone()[0]
         introduced_today = u.execute("SELECT COUNT(*) FROM fsrs_cards WHERE introduced_at_ts>=? AND introduced_at_ts<?", (b0,b1)).fetchone()[0]
         settings = {r["key"]: r["value"] for r in u.execute("SELECT key,value FROM app_settings")}
-        active_key = settings.get("active_collection_key", "core:219")
-        active_source = collection_summary_from_key(active_key, c, u)
+        active_key, active_source = active_source_or_fallback(c, u)
+        settings["active_collection_key"] = active_key
         new_limit = int(settings.get("new_per_day", "20"))
         remaining_slots = -1 if new_limit < 0 else max(0, new_limit - introduced_today)
         active_unscheduled = 0
@@ -767,44 +851,187 @@ def get_bootstrap():
         }
 
 
-def search_content(q, limit=80):
+def search_content(q, filter_name="all", limit=80):
     q = (q or "").strip()
     if not q:
         return []
+    filter_name = str(filter_name or "all").lower()
+    if filter_name not in {"all", "learn", "vocabulary", "courses", "my", "saved"}:
+        filter_name = "all"
+    try:
+        limit = max(1, min(int(limit), 200))
+    except (TypeError, ValueError):
+        limit = 80
     like = f"%{q}%"
     out = []
     with content_conn() as c, user_conn() as u:
-        rows = rows_to_dicts(c.execute(
-            """
-            SELECT content_id,en_us,vi_vn,usage_note,literal_note
-            FROM sentence_content
-            WHERE en_us LIKE ? COLLATE NOCASE OR vi_vn LIKE ? COLLATE NOCASE
-            ORDER BY CASE WHEN en_us LIKE ? COLLATE NOCASE THEN 0 ELSE 1 END, content_id
-            LIMIT ?
-            """,
-            (like, like, like, limit),
-        ))
-        for r in rows:
-            r.update({"item_key":item_key_for_content(r["content_id"],c),"is_custom":False,"audio":audio_url_for(r["content_id"],c)})
-            locs = rows_to_dicts(c.execute(
-                """SELECT m.island_id,m.collection_name,m.topic_name,m.order_index,co.is_vocabulary,co.source_group
-                   FROM content_membership m LEFT JOIN collections co ON co.id=m.island_id
-                   WHERE m.content_id=? ORDER BY COALESCE(co.is_vocabulary,0),m.island_id,m.order_index LIMIT 5""",
-                (r["content_id"],),
-            ))
-            r["locations"] = locs
-            out.append(r)
-        remain = max(0, limit - len(out))
-        if remain:
+        scoped_keys = None
+        if filter_name == "saved":
+            scoped_keys = {row[0] for row in u.execute("SELECT item_key FROM saved_items")}
+        elif filter_name == "my":
+            scoped_keys = {row[0] for row in u.execute("SELECT DISTINCT item_key FROM my_island_members")}
+
+        if filter_name in {"learn", "vocabulary", "courses"}:
+            scope_sql = {
+                "learn": "COALESCE(co.is_vocabulary,0)=0 AND COALESCE(co.source_group,'') NOT LIKE 'course:%'",
+                "vocabulary": "COALESCE(co.is_vocabulary,0)=1",
+                "courses": "COALESCE(co.source_group,'') LIKE 'course:%'",
+            }[filter_name]
+            candidate_sql = f"""
+                SELECT s.content_id,COALESCE(a.canonical_content_id,s.content_id) canonical_id
+                FROM sentence_content s
+                LEFT JOIN srs_alias a ON a.content_id=s.content_id
+                JOIN content_membership m ON m.content_id=s.content_id
+                JOIN collections co ON co.id=m.island_id
+                WHERE (s.en_us LIKE ? COLLATE NOCASE OR s.vi_vn LIKE ? COLLATE NOCASE)
+                  AND {scope_sql}
+                ORDER BY CASE WHEN s.en_us LIKE ? COLLATE NOCASE THEN 0 ELSE 1 END,s.content_id
+                LIMIT ? OFFSET ?
+                """
+            candidates = []
+            candidate_ids = set()
+            batch_size = limit * 6
+            offset = 0
+            while len(candidate_ids) < limit:
+                page = rows_to_dicts(c.execute(candidate_sql, (like, like, like, batch_size, offset)))
+                candidates.extend(page)
+                candidate_ids.update(int(row["canonical_id"]) for row in page)
+                if len(page) < batch_size:
+                    break
+                offset += batch_size
+        else:
+            candidate_sql = """SELECT s.content_id,COALESCE(a.canonical_content_id,s.content_id) canonical_id
+                    FROM sentence_content s LEFT JOIN srs_alias a ON a.content_id=s.content_id
+                    WHERE s.en_us LIKE ? COLLATE NOCASE OR s.vi_vn LIKE ? COLLATE NOCASE
+                    ORDER BY CASE WHEN s.en_us LIKE ? COLLATE NOCASE THEN 0 ELSE 1 END,s.content_id"""
+            if scoped_keys is not None:
+                candidates = rows_to_dicts(c.execute(candidate_sql, (like, like, like)))
+            else:
+                candidates = []
+                candidate_ids = set()
+                batch_size = limit * 6
+                offset = 0
+                while len(candidate_ids) < limit:
+                    page = rows_to_dicts(c.execute(candidate_sql + " LIMIT ? OFFSET ?", (like, like, like, batch_size, offset)))
+                    candidates.extend(page)
+                    candidate_ids.update(int(row["canonical_id"]) for row in page)
+                    if len(page) < batch_size:
+                        break
+                    offset += batch_size
+
+        seen = set()
+        standard_ids = []
+        for candidate in candidates:
+            canonical_id = int(candidate["canonical_id"])
+            item_key = item_key_standard(canonical_id)
+            if scoped_keys is not None and item_key not in scoped_keys:
+                continue
+            if item_key in seen:
+                continue
+            seen.add(item_key)
+            standard_ids.append(canonical_id)
+            if len(standard_ids) >= limit:
+                break
+
+        core_locations = {canonical_id: [] for canonical_id in standard_ids}
+        my_locations = {item_key_standard(canonical_id): [] for canonical_id in standard_ids}
+        for offset in range(0, len(standard_ids), 700):
+            chunk = standard_ids[offset:offset + 700]
+            placeholders = ",".join("?" for _ in chunk)
+            for row in c.execute(
+                f"""SELECT DISTINCT COALESCE(a.canonical_content_id,m.content_id) canonical_id,
+                           m.island_id,m.collection_name,m.topic_name,m.order_index,co.is_vocabulary,co.source_group
+                    FROM content_membership m
+                    LEFT JOIN srs_alias a ON a.content_id=m.content_id
+                    LEFT JOIN collections co ON co.id=m.island_id
+                    WHERE COALESCE(a.canonical_content_id,m.content_id) IN ({placeholders})
+                    ORDER BY m.island_id,m.order_index""",
+                chunk,
+            ):
+                location = dict(row)
+                canonical_id = int(location.pop("canonical_id"))
+                source_group = str(location.get("source_group") or "")
+                location["kind"] = "courses" if source_group.startswith("course:") else ("vocabulary" if location.get("is_vocabulary") else "learn")
+                location["collection_kind"] = "core"
+                core_locations[canonical_id].append(location)
+
+            keys = [item_key_standard(canonical_id) for canonical_id in chunk]
+            for row in u.execute(
+                f"""SELECT m.item_key,i.id island_id,i.name collection_name,'My Islands' topic_name,m.order_index
+                    FROM my_island_members m JOIN my_islands i ON i.id=m.island_id
+                    WHERE m.item_key IN ({placeholders})
+                    ORDER BY i.updated_at_ts DESC,m.order_index""",
+                keys,
+            ):
+                location = dict(row)
+                item_key = location.pop("item_key")
+                location.update({"kind": "my", "collection_kind": "my", "is_vocabulary": 0, "source_group": "my"})
+                my_locations[item_key].append(location)
+
+        for canonical_id in standard_ids:
+            item_key = item_key_standard(canonical_id)
+            item = get_standard_item(canonical_id, c)
+            if not item:
+                continue
+            locations = core_locations[canonical_id] + my_locations[item_key]
+            unique_locations = {}
+            for location in locations:
+                unique_locations.setdefault((location["collection_kind"], int(location["island_id"])), location)
+            locations = list(unique_locations.values())
+            item["locations"] = locations
+            out.append(item)
+            if len(out) >= limit:
+                break
+        if filter_name in {"all", "my", "saved"} and len(out) < limit:
+            custom_limit = "" if scoped_keys is not None else "LIMIT ?"
+            custom_params = [like, like, like]
+            if scoped_keys is None:
+                custom_params.append(limit - len(out))
             for r in u.execute(
-                "SELECT id,en_us,vi_vn,usage_note,literal_note,audio_file,audio_key,audio_expected,note FROM custom_sentences WHERE en_us LIKE ? COLLATE NOCASE OR vi_vn LIKE ? COLLATE NOCASE ORDER BY id DESC LIMIT ?",
-                (like, like, remain),
+                f"""SELECT id,en_us,vi_vn,usage_note,literal_note,audio_file,audio_key,audio_expected,note
+                    FROM custom_sentences
+                    WHERE en_us LIKE ? COLLATE NOCASE OR vi_vn LIKE ? COLLATE NOCASE
+                    ORDER BY CASE WHEN en_us LIKE ? COLLATE NOCASE THEN 0 ELSE 1 END,id DESC {custom_limit}""",
+                custom_params,
             ):
                 d = dict(r)
-                d.update({"item_key":item_key_custom(d["id"]),"custom_id":d["id"],"is_custom":True,"audio":f"/user-audio/{d['audio_file']}" if d.get("audio_file") else None,"locations":[]})
+                key = item_key_custom(d["id"])
+                if scoped_keys is not None and key not in scoped_keys:
+                    continue
+                locations = []
+                for row in u.execute(
+                    """SELECT i.id island_id,i.name collection_name,'My Islands' topic_name,m.order_index
+                       FROM my_island_members m JOIN my_islands i ON i.id=m.island_id
+                       WHERE m.item_key=? ORDER BY i.updated_at_ts DESC,m.order_index""", (key,)
+                ):
+                    location = dict(row)
+                    location.update({"kind": "my", "collection_kind": "my", "is_vocabulary": 0, "source_group": "my"})
+                    locations.append(location)
+                d.update({"item_key":key,"custom_id":d["id"],"is_custom":True,"audio":user_audio_url(d.get("audio_file")),"locations":locations})
                 out.append(d)
+                if len(out) >= limit:
+                    break
         attach_user_state(out, u)
-    return out
+        filtered = []
+        priority = {"learn": 0, "vocabulary": 1, "courses": 2, "my": 3}
+        for item in out:
+            locations = sorted(item.get("locations") or [], key=lambda location: (priority.get(location.get("kind"), 9), int(location.get("island_id") or 0), int(location.get("order_index") or 0)))
+            if filter_name == "saved":
+                include = bool(item.get("saved"))
+            elif filter_name == "all":
+                include = True
+            else:
+                include = any(location.get("kind") == filter_name for location in locations)
+            if not include:
+                continue
+            preferred = next((location for location in locations if filter_name not in {"all", "saved"} and location.get("kind") == filter_name), None)
+            item["locations"] = locations
+            item["primary_location"] = preferred or (locations[0] if locations else None)
+            item["other_location_count"] = max(0, len(locations) - (1 if locations else 0))
+            filtered.append(item)
+            if len(filtered) >= limit:
+                break
+    return filtered
 
 
 def get_saved_items():
@@ -1034,6 +1261,7 @@ def apply_review(item_key, rating, source_mode="active_recall"):
             (item_key,int(rating),card["last_review_ts"],card["state_before"],card["state"],card["due_ts"],card["stability"],card["difficulty"],source_mode),
         )
         u.commit()
+        stats = study_stats_snapshot(c, u)
         return {
             "ok": True,
             "item_key": item_key,
@@ -1046,10 +1274,73 @@ def apply_review(item_key, rating, source_mode="active_recall"):
             "due_in_seconds": max(0, int(card["due_ts"] - now_ts())),
             "review_count": card["review_count"],
             "lapse_count": card["lapse_count"],
+            "srs": {
+                "state": card["state"], "step": card["step"],
+                "stability": card["stability"], "difficulty": card["difficulty"],
+                "due": iso_from_ts(card["due_ts"]), "due_ts": card["due_ts"],
+                "due_now": card["due_ts"] <= now_ts(),
+                "last_review": iso_from_ts(card["last_review_ts"]),
+                "last_review_ts": card["last_review_ts"],
+                "introduced_at": iso_from_ts(card["introduced_at_ts"]),
+                "introduced_at_ts": card["introduced_at_ts"],
+                "review_count": card["review_count"], "lapse_count": card["lapse_count"],
+                "last_rating": card["last_rating"], "suspended": False,
+            },
+            "stats": stats,
             # Learning/Relearning steps are due-aware. The UI may keep them in the session queue,
             # but must never show them before due_ts.
             "learning_pending": card["state"] in (STATE_LEARNING, STATE_RELEARNING),
         }
+
+
+def study_stats_snapshot(c, u):
+    """Return the small, exact counter set needed after a rating; never scans audio."""
+    now = now_ts()
+    b0, b1 = local_day_bounds_ts()
+    settings = {r["key"]: r["value"] for r in u.execute("SELECT key,value FROM app_settings")}
+    active_key, source = active_source_or_fallback(c, u)
+    introduced_today = u.execute(
+        "SELECT COUNT(*) FROM fsrs_cards WHERE introduced_at_ts>=? AND introduced_at_ts<?", (b0, b1)
+    ).fetchone()[0]
+    new_limit = int(settings.get("new_per_day", "20"))
+    remaining = -1 if new_limit < 0 else max(0, new_limit - introduced_today)
+    unscheduled = 0
+    if source:
+        kind, ident = parse_collection_key(active_key)
+        if kind == "core":
+            keys = [item_key_for_content(r[0], c) for r in c.execute(
+                "SELECT content_id FROM content_membership WHERE island_id=? ORDER BY order_index,sentence_id", (ident,)
+            )]
+        else:
+            keys = [r[0] for r in u.execute(
+                "SELECT item_key FROM my_island_members WHERE island_id=? ORDER BY order_index,id", (ident,)
+            )]
+        keys = list(dict.fromkeys(keys))
+        scheduled, suspended = set(), set()
+        for index in range(0, len(keys), 700):
+            chunk = keys[index:index + 700]
+            if not chunk:
+                continue
+            placeholders = ",".join("?" for _ in chunk)
+            scheduled.update(r[0] for r in u.execute(
+                f"SELECT item_key FROM fsrs_cards WHERE item_key IN ({placeholders})", chunk
+            ))
+            suspended.update(r[0] for r in u.execute(
+                f"SELECT item_key FROM suspended_items WHERE item_key IN ({placeholders})", chunk
+            ))
+        unscheduled = sum(1 for key in keys if key not in scheduled and key not in suspended)
+    return {
+        "dueToday": u.execute(
+            "SELECT COUNT(*) FROM fsrs_cards f LEFT JOIN suspended_items s ON s.item_key=f.item_key WHERE f.due_ts<=? AND s.item_key IS NULL", (now,)
+        ).fetchone()[0],
+        "newToday": unscheduled if remaining < 0 else min(unscheduled, remaining),
+        "startedSrs": u.execute("SELECT COUNT(*) FROM fsrs_cards").fetchone()[0],
+        "reviewState": u.execute("SELECT COUNT(*) FROM fsrs_cards WHERE state=?", (STATE_REVIEW,)).fetchone()[0],
+        "introducedToday": introduced_today,
+        "reviewedToday": u.execute(
+            "SELECT COUNT(*) FROM review_log WHERE review_ts>=? AND review_ts<?", (b0, b1)
+        ).fetchone()[0],
+    }
 
 
 def _collection_item_keys(collection_key_value, c, u):
@@ -1303,8 +1594,7 @@ def daily_session(extra=None):
             "SELECT f.item_key FROM fsrs_cards f LEFT JOIN suspended_items s ON s.item_key=f.item_key WHERE f.due_ts<=? AND s.item_key IS NULL ORDER BY f.due_ts,f.state,f.item_key",
             (now,),
         )]
-        active_key = setting_get(u, "active_collection_key", "core:219")
-        source = collection_summary_from_key(active_key, c, u)
+        active_key, source = active_source_or_fallback(c, u)
         new_limit = int(setting_get(u, "new_per_day", "20"))
         b0,b1 = local_day_bounds_ts()
         introduced_today = u.execute("SELECT COUNT(*) FROM fsrs_cards WHERE introduced_at_ts>=? AND introduced_at_ts<?",(b0,b1)).fetchone()[0]
@@ -1659,77 +1949,6 @@ def import_xlsx_to_island(island_id, xlsx_data):
     return {"ok":True,"added":added,"generatedAudioKeys":generated,"missingAudio":added,"warnings":warnings[:20]}
 
 
-def _zip_audio_files(raw):
-    try: z=zipfile.ZipFile(io.BytesIO(raw))
-    except Exception: raise ValueError("ZIP audio không hợp lệ")
-    allowed={".mp3",".wav",".m4a",".aac",".ogg",".webm"}
-    files=[]; total=0
-    for info in z.infolist():
-        if info.is_dir(): continue
-        name=Path(info.filename).name
-        ext=Path(name).suffix.lower()
-        if ext not in allowed: continue
-        if info.file_size>50*1024*1024: continue
-        total += info.file_size
-        if total>1024*1024*1024: raise ValueError("ZIP giải nén quá lớn")
-        files.append((name,info))
-    return z,files
-
-
-def _apply_my_island_audio_entries(island_id, entries):
-    # entries: [(basename, bytes), ...]
-    by_base={}; duplicates=[]
-    for name,raw_audio in entries:
-        name=Path(name).name; k=name.casefold()
-        if k in by_base: duplicates.append(name)
-        else: by_base[k]=(name,raw_audio)
-    with user_conn() as u:
-        rows=rows_to_dicts(u.execute("SELECT cs.id,cs.audio_file,cs.audio_key,cs.audio_expected FROM my_island_members m JOIN custom_sentences cs ON m.item_key='c:'||cs.id WHERE m.island_id=? ORDER BY m.order_index",(int(island_id),)))
-        matched=0; used_names=set(); conflicts=[]; ts=now_ts()
-        for r in rows:
-            candidates=[]
-            if r.get("audio_expected"): candidates.append(Path(r["audio_expected"]).name.casefold())
-            if r.get("audio_key"):
-                k=str(r["audio_key"]).casefold(); candidates.extend([k+ext for ext in (".mp3",".wav",".m4a",".aac",".ogg",".webm")])
-            # One imported file may only be assigned to one sentence. If an expected
-            # filename is already used, continue looking for a unique Audio-Key match.
-            hit_key=next((c for c in candidates if c in by_base and c not in used_names),None)
-            if not hit_key:
-                if any(c in by_base for c in candidates):
-                    conflicts.append(str(r.get("audio_key") or r.get("audio_expected") or r["id"]))
-                continue
-            name,raw_audio=by_base[hit_key]; ext=Path(name).suffix.lower(); out=f"custom_{int(r['id']):06d}{ext}"; old=r.get("audio_file")
-            if old and old!=out:
-                try:(USER_AUDIO/old).unlink(missing_ok=True)
-                except Exception:pass
-            (USER_AUDIO/out).write_bytes(raw_audio)
-            u.execute("UPDATE custom_sentences SET audio_file=?,updated_at_ts=? WHERE id=?",(out,ts,int(r["id"])))
-            matched+=1;used_names.add(Path(name).name.casefold())
-        u.execute("UPDATE my_islands SET updated_at_ts=? WHERE id=?",(ts,int(island_id)));u.commit()
-        missing=u.execute("SELECT COUNT(*) FROM my_island_members m JOIN custom_sentences cs ON m.item_key='c:'||cs.id WHERE m.island_id=? AND (cs.audio_file IS NULL OR cs.audio_file='')",(int(island_id),)).fetchone()[0]
-    unmatched=[name for name,_ in entries if Path(name).name.casefold() not in used_names]
-    return {"ok":True,"matched":matched,"missing":missing,"unmatched":unmatched[:100],"unmatchedCount":len(unmatched),"duplicates":duplicates[:100],"duplicateCount":len(duplicates),"conflicts":conflicts[:100],"conflictCount":len(conflicts)}
-
-
-def bulk_audio_my_island(island_id, zip_data=None, files_data=None):
-    if zip_data:
-        raw=decode_base64_blob(zip_data,300*1024*1024,"ZIP audio");z,files=_zip_audio_files(raw)
-        entries=[(name,z.read(info)) for name,info in files]
-        return _apply_my_island_audio_entries(island_id,entries)
-    if files_data:
-        if not isinstance(files_data,list) or len(files_data)>10000: raise ValueError("Danh sách audio không hợp lệ")
-        entries=[];total=0;allowed={".mp3",".wav",".m4a",".aac",".ogg",".webm"}
-        for f in files_data:
-            name=Path(str(f.get("name") or "")).name;ext=Path(name).suffix.lower()
-            if ext not in allowed: continue
-            raw=decode_base64_blob(f.get("data"),50*1024*1024,"Audio")
-            total+=len(raw)
-            if total>300*1024*1024: raise ValueError("Tổng audio trong folder quá lớn; hãy dùng ZIP")
-            entries.append((name,raw))
-        if not entries: raise ValueError("Folder không có file audio được hỗ trợ")
-        return _apply_my_island_audio_entries(island_id,entries)
-    raise ValueError("Hãy chọn ZIP hoặc folder audio")
-
 def missing_audio_my_island(island_id):
     with user_conn() as u:
         return rows_to_dicts(u.execute("SELECT cs.audio_key,cs.en_us,cs.vi_vn,cs.audio_expected FROM my_island_members m JOIN custom_sentences cs ON m.item_key='c:'||cs.id WHERE m.island_id=? AND (cs.audio_file IS NULL OR cs.audio_file='') ORDER BY m.order_index",(int(island_id),)))
@@ -1743,6 +1962,228 @@ def _user_base_dir():
     if Path(USER_AUDIO).resolve().parent != base:
         raise RuntimeError("Đường dẫn user_audio không hợp lệ")
     return base
+
+
+def _bulk_audio_stage_root():
+    return _user_base_dir() / "bulk_audio_staging"
+
+
+def cleanup_orphan_bulk_audio_staging():
+    """Discard non-resumable Bulk Audio stages left by an earlier process."""
+    return {"ok": True, "removed": BULK_AUDIO_SESSIONS.cleanup_orphans(_bulk_audio_stage_root())}
+
+
+def _bulk_inventory(record):
+    by_name, duplicates = {}, []
+    for index, entry in enumerate(record["files"]):
+        key = Path(entry["name"]).name.casefold()
+        if key in by_name:
+            duplicates.append(entry["name"])
+        else:
+            by_name[key] = (index, entry)
+    return by_name, duplicates
+
+
+def _preview_my_island_audio(record):
+    island_id = int(record["target"])
+    by_name, duplicates = _bulk_inventory(record)
+    with user_conn() as u:
+        if not u.execute("SELECT 1 FROM my_islands WHERE id=?", (island_id,)).fetchone():
+            raise ValueError("Không tìm thấy Island")
+        rows = rows_to_dicts(u.execute(
+            "SELECT cs.id,cs.audio_file,cs.audio_key,cs.audio_expected FROM my_island_members m "
+            "JOIN custom_sentences cs ON m.item_key='c:'||cs.id WHERE m.island_id=? ORDER BY m.order_index", (island_id,)
+        ))
+    used, matches, conflicts = set(), [], []
+    for row in rows:
+        candidates = []
+        if row.get("audio_expected"):
+            candidates.append(Path(row["audio_expected"]).name.casefold())
+        if row.get("audio_key"):
+            key = str(row["audio_key"]).casefold()
+            candidates.extend(key + ext for ext in sorted(ALLOWED_AUDIO_EXTENSIONS))
+        hit = next((candidate for candidate in candidates if candidate in by_name and candidate not in used), None)
+        if not hit:
+            if any(candidate in by_name for candidate in candidates):
+                conflicts.append(str(row.get("audio_key") or row.get("audio_expected") or row["id"]))
+            continue
+        index, entry = by_name[hit]
+        used.add(hit)
+        matches.append({"row_id": int(row["id"]), "entry_index": index, "old_audio": row.get("audio_file")})
+    record["matches"] = matches
+    unmatched = [entry["name"] for entry in record["files"] if Path(entry["name"]).name.casefold() not in used]
+    matched_ids = {match["row_id"] for match in matches}
+    missing = sum(1 for row in rows if not row.get("audio_file") and int(row["id"]) not in matched_ids)
+    return {"ok": True, "token": record["token"], "matched": len(matches), "missing": missing,
+            "unmatched": unmatched[:100], "unmatchedCount": len(unmatched),
+            "duplicates": duplicates[:100], "duplicateCount": len(duplicates),
+            "conflicts": conflicts[:100], "conflictCount": len(conflicts)}
+
+
+def _course_audio_rows(course_key):
+    with content_conn() as c:
+        course = next((item for item in get_courses(c) if item["key"] == course_key and item.get("audio_import")), None)
+        if not course:
+            raise ValueError("Course này không hỗ trợ import audio")
+        ids = [int(item["id"]) for item in course["collections"]]
+        placeholders = ",".join("?" for _ in ids)
+        rows = rows_to_dicts(c.execute(
+            f"SELECT DISTINCT ca.content_id,ca.audio_path,ca.audio_key FROM content_audio ca "
+            f"JOIN content_membership m ON m.content_id=ca.content_id WHERE m.island_id IN ({placeholders}) ORDER BY m.island_id,m.order_index", ids
+        ))
+    return rows
+
+
+def _preview_course_audio(record):
+    rows = _course_audio_rows(record["target"])
+    by_name, duplicates = _bulk_inventory(record)
+    used, matches = set(), []
+    for row in rows:
+        extension = Path(str(row.get("audio_path") or "")).suffix.lower() or ".mp3"
+        candidates = [Path(str(row.get("audio_path") or "")).name.casefold()]
+        if row.get("audio_key"):
+            candidates.insert(0, (str(row["audio_key"]) + extension).casefold())
+        hit = next((candidate for candidate in candidates if candidate in by_name and candidate not in used), None)
+        if not hit:
+            continue
+        index, _entry = by_name[hit]
+        used.add(hit)
+        matches.append({"content_id": int(row["content_id"]), "entry_index": index, "audio_path": str(row["audio_path"])})
+    record["matches"] = matches
+    available = BUNDLED_AUDIO_INDEX.count_course([row["audio_path"] for row in rows], AUDIO, COURSE_AUDIO)
+    unmatched = [entry["name"] for entry in record["files"] if Path(entry["name"]).name.casefold() not in used]
+    return {"ok": True, "token": record["token"], "matched": len(matches),
+            "available": available, "missing": max(0, len(rows) - available - len(matches)),
+            "unmatched": unmatched[:100], "unmatchedCount": len(unmatched),
+            "duplicates": duplicates[:100], "duplicateCount": len(duplicates), "conflictCount": 0}
+
+
+def preview_bulk_audio_session(token):
+    record = BULK_AUDIO_SESSIONS.get(token)
+    if not record["files"]:
+        raise ValueError("Không có file audio để kiểm tra")
+    return _preview_my_island_audio(record) if record["scope"] == "my" else _preview_course_audio(record)
+
+
+def prepare_bulk_audio_path(scope, target, selected_path, mode):
+    if scope not in {"my", "course"} or mode not in {"zip", "folder"}:
+        raise ValueError("Loại Bulk Audio không hợp lệ")
+    if scope == "course" and mode != "zip":
+        raise ValueError("Course chỉ hỗ trợ ZIP audio")
+    record = BULK_AUDIO_SESSIONS.from_zip(_bulk_audio_stage_root(), scope, target, selected_path) if mode == "zip" else BULK_AUDIO_SESSIONS.from_folder(_bulk_audio_stage_root(), scope, target, selected_path)
+    try:
+        return preview_bulk_audio_session(record["token"])
+    except Exception:
+        BULK_AUDIO_SESSIONS.cleanup(record["token"])
+        raise
+
+
+def start_bulk_audio_folder_session(scope, target):
+    if scope not in {"my", "course"} or scope == "course":
+        raise ValueError("Folder audio chỉ hỗ trợ My Islands")
+    record = BULK_AUDIO_SESSIONS.create(_bulk_audio_stage_root(), scope, target)
+    return {"ok": True, "token": record["token"]}
+
+
+def _install_files_atomically(installations, stage):
+    rollback = Path(stage) / "rollback"
+    rollback.mkdir(exist_ok=True)
+    backups, installed = [], []
+    try:
+        for index, (prepared, destination, obsolete) in enumerate(installations):
+            destination = Path(destination)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            candidates = [destination] + ([Path(obsolete)] if obsolete and Path(obsolete) != destination else [])
+            for original in candidates:
+                if original.exists():
+                    backup = rollback / f"{index:05d}-{len(backups):03d}{original.suffix}"
+                    os.replace(original, backup)
+                    backups.append((original, backup))
+            os.replace(prepared, destination)
+            installed.append(destination)
+        return backups, installed
+    except Exception:
+        for path in reversed(installed):
+            path.unlink(missing_ok=True)
+        for original, backup in reversed(backups):
+            original.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(backup, original)
+        raise
+
+
+def _rollback_installed(backups, installed):
+    for path in reversed(installed):
+        path.unlink(missing_ok=True)
+    for original, backup in reversed(backups):
+        original.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(backup, original)
+
+
+def confirm_bulk_audio_session(token):
+    record = BULK_AUDIO_SESSIONS.get(token)
+    if not record.get("matches"):
+        raise ValueError("Không có audio khớp để import")
+    output = record["stage"] / "prepared"
+    output.mkdir(exist_ok=True)
+    installations = []
+    if record["scope"] == "my":
+        island_id = int(record["target"])
+        USER_AUDIO.mkdir(parents=True, exist_ok=True)
+        with user_conn() as u:
+            valid_ids = {int(row[0]) for row in u.execute(
+                "SELECT cs.id FROM my_island_members m JOIN custom_sentences cs ON m.item_key='c:'||cs.id WHERE m.island_id=?", (island_id,)
+            )}
+            for index, match in enumerate(record["matches"]):
+                if match["row_id"] not in valid_ids:
+                    raise ValueError("My Island đã thay đổi; hãy chọn lại audio")
+                entry = record["files"][match["entry_index"]]
+                extension = Path(entry["name"]).suffix.lower()
+                filename = f"custom_{match['row_id']:06d}{extension}"
+                prepared = output / f"{index:05d}{extension}"
+                shutil.copyfile(entry["path"], prepared)
+                old = USER_AUDIO / match["old_audio"] if match.get("old_audio") else None
+                installations.append((prepared, USER_AUDIO / filename, old))
+                match["filename"] = filename
+            backups, installed = _install_files_atomically(installations, record["stage"])
+            try:
+                timestamp = now_ts()
+                for match in record["matches"]:
+                    u.execute("UPDATE custom_sentences SET audio_file=?,updated_at_ts=? WHERE id=?", (match["filename"], timestamp, match["row_id"]))
+                u.execute("UPDATE my_islands SET updated_at_ts=? WHERE id=?", (timestamp, island_id))
+                u.commit()
+            except Exception:
+                u.rollback()
+                _rollback_installed(backups, installed)
+                raise
+        result = _preview_my_island_audio(record)
+        result.update({"ok": True, "imported": len(installations), "matched": len(installations)})
+    else:
+        root = COURSE_AUDIO.resolve()
+        for index, match in enumerate(record["matches"]):
+            entry = record["files"][match["entry_index"]]
+            destination = (COURSE_AUDIO / str(match["audio_path"]).replace("\\", "/").lstrip("/")).resolve()
+            if root not in destination.parents:
+                raise ValueError("Đường dẫn course audio không an toàn")
+            prepared = output / f"{index:05d}{destination.suffix.lower()}"
+            shutil.copyfile(entry["path"], prepared)
+            installations.append((prepared, destination, None))
+        backups, installed = _install_files_atomically(installations, record["stage"])
+        try:
+            BUNDLED_AUDIO_INDEX.invalidate()
+            rows = _course_audio_rows(record["target"])
+            available = BUNDLED_AUDIO_INDEX.count_course([row["audio_path"] for row in rows], AUDIO, COURSE_AUDIO)
+        except Exception:
+            _rollback_installed(backups, installed)
+            BUNDLED_AUDIO_INDEX.invalidate()
+            raise
+        result = {"ok": True, "imported": len(installations), "matched": len(installations), "available": available, "missing": max(0, len(rows)-available)}
+    BULK_AUDIO_SESSIONS.cleanup(token)
+    return result
+
+
+def cancel_bulk_audio_session(token):
+    BULK_AUDIO_SESSIONS.cleanup(token)
+    return {"ok": True}
 
 
 def _db_sidecars(path=None):
@@ -2354,26 +2795,6 @@ def open_user_data_folder(opener=None, platform_name=None):
     return {"ok": True, "path": str(base)}
 
 
-def bulk_audio_course(course_key, zip_data):
-    if course_key != "common_phrases": raise ValueError("Course này không hỗ trợ import audio")
-    raw=decode_base64_blob(zip_data, 300*1024*1024, "ZIP audio")
-    z,files=_zip_audio_files(raw)
-    by_base={Path(n).name.casefold():(n,i) for n,i in files}
-    matched=0;used=set()
-    with content_conn() as c:
-        rows=rows_to_dicts(c.execute("SELECT ca.content_id,ca.audio_path,ca.audio_key FROM content_audio ca JOIN content_membership m ON m.content_id=ca.content_id WHERE m.island_id=700 ORDER BY m.order_index"))
-    for r in rows:
-        key=(str(r.get("audio_key") or "")+".mp3").casefold()
-        hit=by_base.get(key)
-        if not hit: continue
-        name,info=hit; rel=str(r["audio_path"]).replace("\\\\","/").lstrip("/"); dst=(COURSE_AUDIO/rel).resolve()
-        if COURSE_AUDIO.resolve() not in dst.parents: continue
-        dst.parent.mkdir(parents=True,exist_ok=True); dst.write_bytes(z.read(info)); matched+=1;used.add(Path(name).name.casefold())
-    existing=sum(1 for r in rows if (COURSE_AUDIO/str(r["audio_path"])).exists())
-    unmatched=[n for n,_ in files if Path(n).name.casefold() not in used]
-    return {"ok":True,"matched":matched,"available":existing,"missing":max(0,len(rows)-existing),"unmatched":unmatched[:100],"unmatchedCount":len(unmatched)}
-
-
 class Handler(BaseHTTPRequestHandler):
     server_version = f"EnglishLocal/{APP_VERSION}"
 
@@ -2388,6 +2809,27 @@ class Handler(BaseHTTPRequestHandler):
         length=int(self.headers.get("Content-Length","0") or 0)
         if length>420*1024*1024: raise ValueError("Request quá lớn")
         return json.loads(self.rfile.read(length) or b"{}")
+
+    def _receive_bulk_audio_zip(self, parsed):
+        query = urllib.parse.parse_qs(parsed.query)
+        scope = (query.get("scope") or [""])[0]
+        target = (query.get("target") or [""])[0]
+        if scope not in {"my", "course"} or not target:
+            raise ValueError("Đích Bulk Audio không hợp lệ")
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        record = BULK_AUDIO_SESSIONS.from_uploaded_zip(_bulk_audio_stage_root(), scope, target, self.rfile, length)
+        try:
+            return self.send_json(preview_bulk_audio_session(record["token"]))
+        except Exception:
+            BULK_AUDIO_SESSIONS.cleanup(record["token"])
+            raise
+
+    def _receive_bulk_audio_file(self, parsed):
+        query = urllib.parse.parse_qs(parsed.query)
+        token = (query.get("token") or [""])[0]
+        name = urllib.parse.unquote((query.get("name") or [""])[0])
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        return self.send_json(BULK_AUDIO_SESSIONS.add_stream(token, name, self.rfile, length))
 
     def send_file(self,path:Path,cache=False,download_name=None):
         if not path.exists() or not path.is_file(): return self.send_error(404)
@@ -2489,7 +2931,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(get_srs_info(item,col,group))
             if path=="/api/collection":
                 kind=(qs.get("kind") or ["core"])[0]; ident=int((qs.get("id") or ["0"])[0]); d=get_collection_any(kind,ident); return self.send_json(d if d else {"error":"not found"},200 if d else 404)
-            if path=="/api/search": return self.send_json({"items":search_content((qs.get("q") or [""])[0])})
+            if path=="/api/search": return self.send_json({"items":search_content((qs.get("q") or [""])[0],(qs.get("filter") or ["all"])[0])})
             if path=="/api/saved": return self.send_json({"items":get_saved_items()})
             if path=="/api/my-islands": return self.send_json({"items":get_my_islands()})
             if path=="/api/my-island/missing-audio": return self.send_json({"items":missing_audio_my_island(int((qs.get("id") or ["0"])[0]))})
@@ -2517,10 +2959,16 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"error":str(e)},400)
 
     def do_POST(self):
-        path=urllib.parse.urlparse(self.path).path
+        parsed=urllib.parse.urlparse(self.path); path=parsed.path
         if path=="/api/data/restore":
             try:
                 return self._receive_restore_zip()
+            except Exception as e:
+                return self.send_json({"error":str(e)},400)
+        if path in {"/api/bulk-audio/zip", "/api/bulk-audio/file"}:
+            try:
+                with USER_DATA_LOCK:
+                    return self._receive_bulk_audio_zip(parsed) if path.endswith("/zip") else self._receive_bulk_audio_file(parsed)
             except Exception as e:
                 return self.send_json({"error":str(e)},400)
         if RESTORE_SHUTDOWN_PENDING.is_set():
@@ -2549,8 +2997,10 @@ class Handler(BaseHTTPRequestHandler):
             if path=="/api/my-island/remove": return self.send_json(remove_from_my_island(data.get("id"),data.get("item_key")))
             if path=="/api/my-island/reorder": return self.send_json(reorder_my_island(data.get("id"),data.get("item_keys")))
             if path=="/api/my-island/import-xlsx": return self.send_json(import_xlsx_to_island(data.get("id"),data.get("xlsx_data")))
-            if path=="/api/my-island/bulk-audio": return self.send_json(bulk_audio_my_island(data.get("id"),data.get("zip_data"),data.get("files")))
-            if path=="/api/course/bulk-audio": return self.send_json(bulk_audio_course(data.get("course_key"),data.get("zip_data")))
+            if path=="/api/bulk-audio/start": return self.send_json(start_bulk_audio_folder_session(data.get("scope"),data.get("target")))
+            if path=="/api/bulk-audio/preview": return self.send_json(preview_bulk_audio_session(data.get("token")))
+            if path=="/api/bulk-audio/confirm": return self.send_json(confirm_bulk_audio_session(data.get("token")))
+            if path=="/api/bulk-audio/cancel": return self.send_json(cancel_bulk_audio_session(data.get("token")))
             if path=="/api/custom/create": return self.send_json(create_custom_sentence(data.get("en_us"),data.get("vi_vn",""),data.get("usage_note",""),data.get("literal_note",""),data.get("audio_data"),data.get("audio_name",""),data.get("audio_type",""),data.get("island_id"),data.get("audio_key"),data.get("audio_expected"),data.get("note","")))
             return self.send_error(404)
         except Exception as e:
@@ -2566,6 +3016,7 @@ def main():
     if restore_result and not restore_result.get("ok") and not restore_result.get("rollbackOk", True):
         print("Khôi phục và rollback đều thất bại; không mở app để tránh dùng profile không an toàn.")
         return
+    cleanup_orphan_bulk_audio_staging()
     user_conn().close()
     httpd=ThreadingHTTPServer((HOST,args.port),Handler); url=f"http://{HOST}:{args.port}"
     configure_restore_lifecycle(httpd.shutdown)

@@ -189,6 +189,60 @@ def test_daily_queue_and_global_card():
         shutil.rmtree(tmp,ignore_errors=True)
 
 
+def test_daily_source_switch_preserves_progress_and_deleted_my_island_falls_back():
+    tmp,old=_temp_user_env('english_daily_source_test_')
+    try:
+        with sv.content_conn() as c:
+            _topics,collections=sv.ordered_collections(c)
+            learn=next(x for x in collections if not x['is_vocabulary'])
+            vocabulary=next(x for x in collections if x['is_vocabulary'])
+            course=next(x for x in sv.get_courses(c) if x['key']=='english_by_topic')['collections'][0]
+        sources=[f"core:{learn['id']}",f"core:{vocabulary['id']}",f"core:{course['id']}"]
+        with sv.user_conn() as u:
+            u.execute("INSERT INTO collection_progress(collection_key,last_index,updated_at_ts) VALUES(?,?,?)",(sources[0],7,sv.now_ts()))
+            u.commit()
+        for key in sources:
+            assert sv.set_active_source(key)['collectionKey']==key
+            boot=sv.get_bootstrap()
+            assert boot['activeSource']['collectionKey']==key
+        with sv.user_conn() as u:
+            assert u.execute("SELECT last_index FROM collection_progress WHERE collection_key=?",(sources[0],)).fetchone()[0]==7
+
+        island=sv.create_my_island('Temporary Daily Source','fallback test')
+        my_key=f"my:{island['id']}"
+        sv.set_active_source(my_key)
+        assert sv.get_bootstrap()['activeSource']['collectionKey']==my_key
+        sv.delete_my_island(island['id'])
+        boot=sv.get_bootstrap()
+        assert boot['activeSource'] is not None
+        assert boot['activeSource']['collectionKey']==sv.USER_SETTING_DEFAULTS['active_collection_key']
+
+        with sv.user_conn() as u:
+            sv.setting_set(u,'active_collection_key','my:999999')
+            u.commit()
+        session=sv.daily_session()
+        assert session['activeSource'] is not None
+        with sv.user_conn() as u:
+            assert sv.setting_get(u,'active_collection_key')==sv.USER_SETTING_DEFAULTS['active_collection_key']
+    finally:
+        _restore_user_env(tmp,old)
+
+
+def test_course_catalog_is_uniform_and_data_driven():
+    assert [x['key'] for x in sv.COURSE_CATALOG]==['essential4000','common_phrases','english_by_topic']
+    with sv.content_conn() as c:
+        courses=sv.get_courses(c)
+    assert [x['key'] for x in courses]==['essential4000','common_phrases','english_by_topic']
+    for course in courses:
+        assert {'key','name','description','layout','sentence_count','audio_available','audio_missing','collections','sections'}<=set(course)
+        assert course['sentence_count']==sum(int(x['sentence_count']) for x in course['collections'])
+    essential,phrases,topic=courses
+    assert len(essential['sections'])==6
+    assert len(essential['collections'])==180 and essential['sentence_count']==3600
+    assert len(phrases['collections'])==1 and phrases['sentence_count']==852
+    assert len(topic['collections'])==30 and topic['sentence_count']==990
+
+
 def test_auto_delay_setting_validation():
     tmp=Path(tempfile.mkdtemp(prefix='english_setting_test_'))
     old=(sv.USER_DIR,sv.USER_DB,sv.USER_AUDIO)
@@ -432,6 +486,31 @@ def test_english_by_topic_import_rolls_back_atomically():
     tmp=Path(tempfile.mkdtemp(prefix='english_by_topic_rollback_test_'))
     database=tmp/'content.sqlite'
     try:
+        with sv.content_conn() as source:
+            source_rows=source.execute(
+                """SELECT co.name,co.description,m.order_index,s.en_us,s.vi_vn,ca.audio_path
+                   FROM content_membership m JOIN collections co ON co.id=m.island_id
+                   JOIN sentence_content s ON s.content_id=m.content_id
+                   JOIN content_audio ca ON ca.content_id=m.content_id
+                   WHERE co.source_group='course:english_by_topic'
+                   ORDER BY co.id,m.order_index,m.sentence_id"""
+            ).fetchall()
+        rows=[];topics_by_unit={}
+        for row in source_rows:
+            unit,topic_en=str(row['name']).split(' · ',1)
+            item={
+                'course':'English by Topic','unit':unit,'topic_en':topic_en,
+                'topic_vi':str(row['description']),'index':str(row['order_index']),
+                'audio_file':Path(str(row['audio_path'])).name,
+                'english':str(row['en_us']),'vietnamese':str(row['vi_vn']),
+            }
+            rows.append(item)
+            topics_by_unit.setdefault(unit,{
+                'unit':unit,'topic_en':topic_en,'topic_vi':str(row['description']),'sentence_count':'0'
+            })
+            topics_by_unit[unit]['sentence_count']=str(int(topics_by_unit[unit]['sentence_count'])+1)
+        topics=list(topics_by_unit.values())
+        assert len(rows)==990 and len(topics)==30
         shutil.copy2(sv.CONTENT_DB,database)
         with sqlite3.connect(database) as c:
             c.execute('DELETE FROM srs_alias WHERE content_id BETWEEN 30001 AND 30990')
@@ -440,7 +519,6 @@ def test_english_by_topic_import_rolls_back_atomically():
             c.execute('DELETE FROM sentence_content WHERE content_id BETWEEN 30001 AND 30990')
             c.execute("DELETE FROM collections WHERE source_group='course:english_by_topic'")
             c.execute("CREATE TRIGGER force_topic_import_failure BEFORE INSERT ON sentence_content WHEN NEW.content_id=30500 BEGIN SELECT RAISE(ABORT,'forced rollback test'); END")
-        rows,topics,_manifest,_audio=importer.read_package(ROOT/'English_by_Topic_U1-U30_app_package.zip')
         try:
             importer.import_database(database,rows,topics)
             raise AssertionError('forced import failure did not occur')
@@ -478,7 +556,7 @@ def test_user_db_migration_adds_srs_management_without_losing_existing_settings(
         shutil.rmtree(tmp,ignore_errors=True)
 
 def run_all():
-    tests=[test_first_steps,test_reference_random_sequences,test_retention_direction,test_lapse_relearning,test_daily_queue_and_global_card,test_auto_delay_setting_validation,test_user_conn_creates_missing_parent_directories,test_review_now_and_reset_preserve_memory_and_history,test_suspend_resume_excluded_from_daily_for_new_and_due_cards,test_bulk_collection_uses_unique_canonical_keys,test_retention_reschedule_off_on_and_learning_untouched,test_course_and_book_bulk_scope,test_english_by_topic_content_runtime_saved_and_srs,test_english_by_topic_import_rolls_back_atomically,test_user_db_migration_adds_srs_management_without_losing_existing_settings]
+    tests=[test_first_steps,test_reference_random_sequences,test_retention_direction,test_lapse_relearning,test_daily_queue_and_global_card,test_daily_source_switch_preserves_progress_and_deleted_my_island_falls_back,test_course_catalog_is_uniform_and_data_driven,test_auto_delay_setting_validation,test_user_conn_creates_missing_parent_directories,test_review_now_and_reset_preserve_memory_and_history,test_suspend_resume_excluded_from_daily_for_new_and_due_cards,test_bulk_collection_uses_unique_canonical_keys,test_retention_reschedule_off_on_and_learning_untouched,test_course_and_book_bulk_scope,test_english_by_topic_content_runtime_saved_and_srs,test_english_by_topic_import_rolls_back_atomically,test_user_db_migration_adds_srs_management_without_losing_existing_settings]
     for fn in tests:
         fn(); print('PASS',fn.__name__)
     print(f'PASS ALL: {len(tests)} test groups')

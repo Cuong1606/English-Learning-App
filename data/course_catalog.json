@@ -1,0 +1,28 @@
+[
+  {
+    "key": "essential4000",
+    "name": "4000 Essential English Words",
+    "description": "6 Books · 180 Units",
+    "match": {"type": "prefix", "value": "course:essential4000:"},
+    "layout": "books",
+    "group_key": "course:essential4000",
+    "audio_import": false
+  },
+  {
+    "key": "common_phrases",
+    "name": "Common English Phrases",
+    "description": "Câu giao tiếp · nghĩa Việt biên soạn lại",
+    "match": {"type": "exact", "value": "course:common_phrases"},
+    "layout": "collection",
+    "audio_import": true
+  },
+  {
+    "key": "english_by_topic",
+    "name": "English by Topic",
+    "description": "30 chủ đề giao tiếp hằng ngày",
+    "match": {"type": "exact", "value": "course:english_by_topic"},
+    "layout": "units",
+    "group_key": "course:english_by_topic",
+    "audio_import": false
+  }
+]

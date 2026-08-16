@@ -1,13 +1,15 @@
-ENGLISH LEARNING APP V1.2.0
+ENGLISH LEARNING APP V1.3.0
 ===========================
 
-MỞ APP
-1) Double-click: start_app.bat
-2) Không cần tạo icon Desktop.
+MỞ BẢN WINDOWS RELEASE
+1) Giải nén nguyên thư mục Release.
+2) Double-click: English Learning App.exe
+3) Người dùng bản Release không cần cài Python và không cần Edge/Chrome.
+4) App desktop dùng Microsoft Edge WebView2 Runtime; Windows 10/11 thường đã có sẵn.
 
-Nếu app không mở, chạy: Kiem tra loi.bat
-Log server trên Windows:
-%LOCALAPPDATA%\EnglishLocal\launcher_server.log
+CHẠY TỪ SOURCE (DÀNH CHO PHÁT TRIỂN)
+- Cài Python 3 rồi chạy start_app.bat.
+- Kiem tra loi.bat và launcher_server.log chỉ dành cho luồng chạy source.
 
 NỘI DUNG
 - Learn: 8 Topics / 54 Islands
@@ -25,6 +27,7 @@ IMPORT XLSX / BULK AUDIO
 - Bulk Audio nhận ZIP/folder và tự ghép theo Audio Key hoặc tên file audio.
 - Ví dụ Audio Key T001 nên dùng audio T001.mp3.
 - App báo số file đã ghép / còn thiếu / không khớp / xung đột.
+- ZIP/folder được stream hoặc xử lý trực tiếp ở backend; báo cáo được hiển thị trước khi xác nhận import.
 
 HỌC & ÔN TẬP
 - Learn: học theo danh sách, nghe từng câu hoặc Auto Next.
@@ -44,9 +47,12 @@ Cập nhật app không làm mất tiến độ, My Islands hoặc lịch SRS n�
 - Settings > Dữ liệu cho phép Reset, xóa sạch profile, sao lưu và khôi phục trực tiếp từ ZIP.
 - Khi khôi phục, app tự kiểm tra backup, tạo safety snapshot rồi đóng hoàn toàn. Ở lần mở app thủ công tiếp theo, dữ liệu được khôi phục đồng bộ trước khi database/server/UI khởi động; không cần giải nén backup và không chạy helper nền trong luồng bình thường.
 
-YÊU CẦU
-- Windows có Python 3.
-- Microsoft Edge hoặc Google Chrome.
+V1.3.0
+- Đổi nguồn câu mới ngay tại Home/Review, giữ nguyên progress và fallback an toàn.
+- Courses hiển thị 3 card gọn và render từ metadata.
+- Active Recall cập nhật queue/counters cục bộ; bootstrap dùng audio index runtime.
+- Bulk Audio bỏ payload Base64 lớn, có staging, pre-import report và rollback.
+- Search có filter và gộp canonical sentence ở nhiều vị trí.
 
 V1.2.0
 - Thêm English by Topic: 30 Units / 990 câu / 990 audio.
