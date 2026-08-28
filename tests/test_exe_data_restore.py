@@ -109,7 +109,7 @@ def wait_app(profile_base, previous_pid=None, timeout=60):
         if runtime and runtime.get("pid") != previous_pid and pid_alive(runtime.get("pid")):
             try:
                 boot = http_json(runtime["port"], "/api/bootstrap", timeout=2)
-                if boot.get("appVersion") == "1.3.0":
+                if boot.get("appVersion") == "1.4.0":
                     return runtime, boot
             except Exception as exc:
                 last = exc
@@ -370,9 +370,9 @@ def main(argv=None):
         app_pids.append(runtime["pid"])
         port = runtime["port"]
 
-        assert_true(boot.get("appVersion") == "1.3.0", "About/bootstrap version mismatch")
+        assert_true(boot.get("appVersion") == "1.4.0", "About/bootstrap version mismatch")
         exercise_english_by_topic(port, boot, report)
-        report["checks"].append("About/bootstrap version 1.3.0")
+        report["checks"].append("About/bootstrap version 1.4.0")
 
         first_collection = next(c for c in boot["collections"] if int(c.get("sentence_count") or 0) > 0)
         collection = http_json(port, f"/api/collection?kind=core&id={first_collection['id']}")

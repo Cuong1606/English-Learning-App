@@ -1,4 +1,4 @@
-ENGLISH LEARNING APP V1.3.0 - DONG GOI WINDOWS
+ENGLISH LEARNING APP V1.4.0 - DONG GOI WINDOWS
 
 MUC TIEU
 - Tao app Windows co cua so rieng.
@@ -7,7 +7,7 @@ MUC TIEU
 - App van chay local/offline; du lieu hoc ca nhan nam trong LocalAppData\EnglishLocal.
 
 CACH LAM
-1. Dung source tree V1.3.0 day du:
+1. Dung source tree V1.4.0 day du:
    app_version.py
    desktop_app.py
    restore_helper.py

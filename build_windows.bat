@@ -58,7 +58,7 @@ exit /b 0
 
 :missing
 echo LOI: Thu muc build khong du file app/data/audio.
-echo Hay dung thu muc source English Learning App V1.3.0 day du.
+echo Hay dung thu muc source English Learning App V1.4.0 day du.
 pause
 exit /b 2
 

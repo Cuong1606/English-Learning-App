@@ -1,4 +1,4 @@
-ENGLISH LEARNING APP V1.3.0
+ENGLISH LEARNING APP V1.4.0
 ===========================
 
 MỞ BẢN WINDOWS RELEASE
@@ -46,6 +46,12 @@ DỮ LIỆU CÁ NHÂN TRÊN WINDOWS
 Cập nhật app không làm mất tiến độ, My Islands hoặc lịch SRS nếu giữ thư mục trên.
 - Settings > Dữ liệu cho phép Reset, xóa sạch profile, sao lưu và khôi phục trực tiếp từ ZIP.
 - Khi khôi phục, app tự kiểm tra backup, tạo safety snapshot rồi đóng hoàn toàn. Ở lần mở app thủ công tiếp theo, dữ liệu được khôi phục đồng bộ trước khi database/server/UI khởi động; không cần giải nén backup và không chạy helper nền trong luồng bình thường.
+
+V1.4.0
+- Có thể chọn văn bản trong app và dùng Ctrl+C để sao chép.
+- Tốc độ audio điều chỉnh từ 0.25x đến 2.00x và được ghi nhớ.
+- My Islands hỗ trợ Export/Import file .island.zip di động, gồm nội dung và custom audio cần thiết nhưng không gồm tiến độ hay dữ liệu tài khoản.
+- Xóa My Island dùng hộp thoại trong app; chỉ dọn câu/audio/progress tự thêm khi không còn Island nào khác sử dụng, còn câu canonical và tiến độ được giữ lại.
 
 V1.3.0
 - Đổi nguồn câu mới ngay tại Home/Review, giữ nguyên progress và fallback an toàn.

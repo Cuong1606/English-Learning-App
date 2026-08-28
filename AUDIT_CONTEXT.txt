@@ -2,7 +2,7 @@ CHATGPT SOURCE AUDIT SNAPSHOT
 =============================
 Branch: feature/v1.3-ux-performance
 HEAD commit: 5ec743af78285598fb39087347e1a01a0e3c77e8
-APP_VERSION: 1.3.0
+APP_VERSION: 1.4.0
 
 Modified files:
   - AUDIO_ASSETS.md
