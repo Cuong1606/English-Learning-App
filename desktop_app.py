@@ -60,6 +60,52 @@ class DesktopApi:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
+    def export_island(self, island_id, suggested_name):
+        """Export one My Island through the native Windows Save dialog."""
+        window = webview.windows[0] if webview.windows else None
+        if window is None:
+            return {"ok": False, "error": "Cửa sổ ứng dụng chưa sẵn sàng"}
+        try:
+            filename = str(suggested_name or "My Island.island.zip")
+            paths = window.create_file_dialog(
+                webview.FileDialog.SAVE,
+                save_filename=filename,
+                file_types=("My Island package (*.island.zip)",),
+            )
+            if not paths:
+                return {"ok": False, "cancelled": True}
+            selected = paths[0] if not isinstance(paths, str) else paths
+            selected_text = str(selected)
+            if not selected_text.lower().endswith(".island.zip"):
+                if selected_text.lower().endswith(".zip"):
+                    selected_text = selected_text[:-4]
+                selected_text += ".island.zip"
+            result = server.create_island_export(int(island_id), Path(selected_text))
+            return {
+                "ok": True, "filename": result["filename"],
+                "itemCount": result["itemCount"], "audioFileCount": result["audioFileCount"],
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def pick_island_import(self):
+        """Select and fully validate a portable Island before any profile change."""
+        window = webview.windows[0] if webview.windows else None
+        if window is None:
+            return {"ok": False, "error": "Cửa sổ ứng dụng chưa sẵn sàng"}
+        try:
+            paths = window.create_file_dialog(
+                webview.FileDialog.OPEN,
+                allow_multiple=False,
+                file_types=("My Island package (*.island.zip)",),
+            )
+            if not paths:
+                return {"ok": False, "cancelled": True}
+            selected = paths[0] if not isinstance(paths, str) else paths
+            return server.prepare_island_import_path(selected)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
 
 def show_message(text, title=APP_TITLE, flags=0x40):
     if os.name == "nt":
@@ -122,6 +168,7 @@ def main():
             )
             return 1
         server.cleanup_orphan_bulk_audio_staging()
+        server.cleanup_orphan_island_import_staging()
         server.user_conn().close()
 
         # Port 0 lets Windows choose an available local port automatically.

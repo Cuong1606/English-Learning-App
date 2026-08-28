@@ -27,6 +27,12 @@ from pathlib import Path, PurePosixPath
 from app_version import APP_VERSION, BACKUP_FORMAT_VERSION, USER_DB_SCHEMA_VERSION
 from audio_index import BUNDLED_AUDIO_INDEX
 from bulk_audio import ALLOWED_AUDIO_EXTENSIONS, BULK_AUDIO_SESSIONS
+from island_portability import (
+    ISLAND_IMPORT_SESSIONS,
+    MAX_ARCHIVE_BYTES as MAX_ISLAND_ARCHIVE_BYTES,
+    suggested_export_filename as suggested_island_export_filename,
+    write_package as write_island_package,
+)
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
@@ -1759,11 +1765,84 @@ def update_my_island(island_id,name,description=""):
 
 
 def delete_my_island(island_id):
-    with user_conn() as u:
-        u.execute("DELETE FROM my_islands WHERE id=?",(int(island_id),));
-        if setting_get(u,"active_collection_key","")==collection_key("my",island_id): setting_set(u,"active_collection_key","core:219")
-        u.commit()
-    return {"ok":True}
+    island_id = int(island_id)
+    base = _user_base_dir()
+    base.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=".delete_island_", dir=base))
+    moved_audio = []
+    committed = False
+    try:
+        with user_conn() as u:
+            u.execute("BEGIN IMMEDIATE")
+            if not u.execute("SELECT 1 FROM my_islands WHERE id=?", (island_id,)).fetchone():
+                raise ValueError("Không tìm thấy My Island")
+            custom_rows = u.execute(
+                """SELECT cs.id,cs.audio_file
+                   FROM my_island_members m JOIN custom_sentences cs ON m.item_key='c:'||cs.id
+                   WHERE m.island_id=? AND NOT EXISTS(
+                       SELECT 1 FROM my_island_members other
+                       WHERE other.item_key=m.item_key AND other.island_id<>m.island_id
+                   ) ORDER BY cs.id""",
+                (island_id,),
+            ).fetchall()
+            custom_ids = [int(row["id"]) for row in custom_rows]
+            custom_id_set = set(custom_ids)
+            custom_keys = [item_key_custom(custom_id) for custom_id in custom_ids]
+            audio_names = []
+            for row in custom_rows:
+                name = str(row["audio_file"] or "")
+                if not name:
+                    continue
+                if not _safe_user_audio_name(name):
+                    raise ValueError(f"Tên custom audio không hợp lệ: {name}")
+                shared = any(
+                    int(other[0]) not in custom_id_set
+                    for other in u.execute("SELECT id FROM custom_sentences WHERE audio_file=?", (name,))
+                )
+                if not shared and name not in audio_names:
+                    audio_names.append(name)
+            for index, name in enumerate(audio_names):
+                source = USER_AUDIO / name
+                if not source.is_file():
+                    continue
+                backup = stage / f"{index:05d}{source.suffix.lower()}"
+                os.replace(source, backup)
+                moved_audio.append((source, backup))
+            for key in custom_keys:
+                u.execute("DELETE FROM saved_items WHERE item_key=?", (key,))
+                u.execute("DELETE FROM suspended_items WHERE item_key=?", (key,))
+                u.execute("DELETE FROM fsrs_cards WHERE item_key=?", (key,))
+                u.execute("DELETE FROM review_log WHERE item_key=?", (key,))
+            if custom_ids:
+                placeholders = ",".join("?" for _ in custom_ids)
+                u.execute(f"DELETE FROM custom_sentences WHERE id IN ({placeholders})", custom_ids)
+            u.execute("DELETE FROM my_islands WHERE id=?", (island_id,))
+            u.execute("DELETE FROM collection_progress WHERE collection_key=?", (collection_key("my", island_id),))
+            if setting_get(u,"active_collection_key","")==collection_key("my",island_id):
+                setting_set(u,"active_collection_key","core:219")
+            u.commit()
+            committed = True
+        return {
+            "ok": True,
+            "deletedCustomSentences": len(custom_ids),
+            "deletedCustomAudio": len(moved_audio),
+        }
+    except Exception as original_error:
+        rollback_error = None
+        for original, backup in reversed(moved_audio):
+            try:
+                original.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(backup, original)
+            except Exception as exc:
+                rollback_error = exc
+        if rollback_error is not None:
+            raise RuntimeError(
+                f"Xóa Island thất bại ({original_error}); khôi phục audio cũng thất bại ({rollback_error})"
+            ) from original_error
+        raise
+    finally:
+        if committed or not moved_audio or all(not backup.exists() for _, backup in moved_audio):
+            shutil.rmtree(stage, ignore_errors=True)
 
 
 def add_to_my_island(island_id,item_key):
@@ -1833,6 +1912,280 @@ def create_custom_sentence(en_us,vi_vn="",usage_note="",literal_note="",audio_da
             audio_path.unlink(missing_ok=True)
         raise
     return {"ok":True,"custom_id":cid,"item_key":item_key_custom(cid),"audio_file":audio_file}
+
+
+def _portable_content(item):
+    return {
+        "enUs": str(item.get("en_us") or ""),
+        "viVn": str(item.get("vi_vn") or ""),
+        "usageNote": str(item.get("usage_note") or ""),
+        "literalNote": str(item.get("literal_note") or ""),
+        "audioKey": str(item.get("audio_key") or ""),
+        "audioExpected": str(item.get("audio_expected") or ""),
+        "note": str(item.get("note") or ""),
+    }
+
+
+def create_island_export(island_id, output_path):
+    """Export one Island's content without progress or other account state."""
+    island_id = int(island_id)
+    audio_files = []
+    with content_conn() as c, user_conn() as u:
+        island = u.execute("SELECT name,description FROM my_islands WHERE id=?", (island_id,)).fetchone()
+        if not island:
+            raise ValueError("Không tìm thấy My Island")
+        members = u.execute(
+            "SELECT item_key FROM my_island_members WHERE island_id=? ORDER BY order_index,id", (island_id,)
+        ).fetchall()
+        items = []
+        for position, row in enumerate(members, 1):
+            kind, ident = parse_item_key(row[0])
+            item = resolve_item(row[0], c, u)
+            if not item:
+                raise ValueError(f"Không thể export câu #{position} vì nội dung không còn tồn tại")
+            content = _portable_content(item)
+            if kind == "s":
+                items.append({"kind": "canonical", "contentId": canonical_content_id(ident, c), "content": content})
+                continue
+            ref = f"custom-{position:06d}"
+            audio_name = None
+            stored_name = str(item.get("audio_file") or "")
+            if stored_name:
+                if not _safe_user_audio_name(stored_name):
+                    raise ValueError(f"Tên custom audio không hợp lệ: {stored_name}")
+                source = USER_AUDIO / stored_name
+                if not source.is_file():
+                    raise ValueError(f"Thiếu custom audio cần export: {stored_name}")
+                audio_name = f"audio/{ref}{source.suffix.lower()}"
+                audio_files.append((audio_name, source))
+            items.append({"kind": "custom", "ref": ref, "content": content, "audio": audio_name})
+        package = {"name": str(island["name"]), "description": str(island["description"] or ""), "items": items}
+        result = write_island_package(output_path, package, audio_files, APP_VERSION)
+    result.update({"islandId": island_id, "itemCount": len(items), "audioFileCount": len(audio_files)})
+    return result
+
+
+def _island_import_stage_root():
+    return _user_base_dir() / "island_import_staging"
+
+
+def _island_name_exists(u, name):
+    folded = str(name).strip().casefold()
+    return any(str(row[0]).strip().casefold() == folded for row in u.execute("SELECT name FROM my_islands"))
+
+
+def _suggested_import_island_name(u, name):
+    names = {str(row[0]).strip().casefold() for row in u.execute("SELECT name FROM my_islands")}
+    if str(name).strip().casefold() not in names:
+        return str(name).strip()
+    number = 2
+    while True:
+        suffix = f" ({number})"
+        candidate = str(name).strip()[:120-len(suffix)].rstrip() + suffix
+        if candidate.casefold() not in names:
+            return candidate
+        number += 1
+
+
+def preview_island_import(record):
+    island = record["island"]
+    with user_conn() as u:
+        conflict = _island_name_exists(u, island["name"])
+        suggested = _suggested_import_island_name(u, island["name"])
+    return {
+        "ok": True,
+        "token": record["token"],
+        "name": island["name"],
+        "description": island["description"],
+        "itemCount": len(island["items"]),
+        "audioFileCount": sum(1 for item in island["items"] if item.get("audio")),
+        "nameConflict": conflict,
+        "suggestedName": suggested,
+        "formatVersion": record["manifest"]["formatVersion"],
+        "sourceAppVersion": record["manifest"]["appVersion"],
+    }
+
+
+def prepare_island_import_path(selected_path):
+    record = ISLAND_IMPORT_SESSIONS.from_path(_island_import_stage_root(), selected_path)
+    try:
+        return preview_island_import(record)
+    except Exception:
+        ISLAND_IMPORT_SESSIONS.cleanup(record["token"])
+        raise
+
+
+def prepare_island_import_stream(source, size):
+    record = ISLAND_IMPORT_SESSIONS.from_stream(_island_import_stage_root(), source, size)
+    try:
+        return preview_island_import(record)
+    except Exception:
+        ISLAND_IMPORT_SESSIONS.cleanup(record["token"])
+        raise
+
+
+def _portable_standard_matches(item, content):
+    return all(str(item.get(column) or "") == content[key] for column, key in (
+        ("en_us", "enUs"), ("vi_vn", "viVn"),
+        ("usage_note", "usageNote"), ("literal_note", "literalNote"),
+    ))
+
+
+def _find_portable_canonical(c, content, preferred_id=None):
+    if preferred_id is not None:
+        preferred = get_standard_item(int(preferred_id), c)
+        if preferred and _portable_standard_matches(preferred, content):
+            return preferred["item_key"]
+    rows = c.execute(
+        """SELECT content_id FROM sentence_content
+           WHERE en_us=? AND COALESCE(vi_vn,'')=? AND COALESCE(usage_note,'')=?
+             AND COALESCE(literal_note,'')=? ORDER BY content_id""",
+        (content["enUs"], content["viVn"], content["usageNote"], content["literalNote"]),
+    ).fetchall()
+    for row in rows:
+        item = get_standard_item(row[0], c)
+        if item and _portable_standard_matches(item, content):
+            return item["item_key"]
+    return None
+
+
+def _custom_can_use_canonical(content, audio_name):
+    return not audio_name and not any(content[key] for key in ("audioKey", "audioExpected", "note"))
+
+
+def _portable_custom_candidates(u, content):
+    return u.execute(
+        """SELECT id,audio_file FROM custom_sentences
+           WHERE en_us=? AND vi_vn=? AND usage_note=? AND literal_note=?
+             AND COALESCE(audio_key,'')=? AND COALESCE(audio_expected,'')=? AND note=?
+           ORDER BY id""",
+        (content["enUs"], content["viVn"], content["usageNote"], content["literalNote"],
+         content["audioKey"], content["audioExpected"], content["note"]),
+    ).fetchall()
+
+
+def _find_reusable_portable_custom(u, content, audio_name, audio_hash, used_keys):
+    for row in _portable_custom_candidates(u, content):
+        key = item_key_custom(row["id"])
+        if key in used_keys:
+            continue
+        stored = str(row["audio_file"] or "")
+        if not audio_name:
+            return {"id": int(row["id"]), "key": key, "attachAudio": False}
+        if not stored:
+            return {"id": int(row["id"]), "key": key, "attachAudio": True}
+        if _safe_user_audio_name(stored):
+            path = USER_AUDIO / stored
+            if path.is_file() and _sha256_file(path) == audio_hash:
+                return {"id": int(row["id"]), "key": key, "attachAudio": False}
+    return None
+
+
+def _insert_portable_custom(u, content, timestamp):
+    cur = u.execute(
+        """INSERT INTO custom_sentences(
+             en_us,vi_vn,usage_note,literal_note,audio_file,audio_key,audio_expected,note,
+             created_at_ts,updated_at_ts) VALUES(?,?,?,?,NULL,?,?,?,?,?)""",
+        (content["enUs"], content["viVn"], content["usageNote"], content["literalNote"],
+         content["audioKey"] or None, content["audioExpected"] or None, content["note"],
+         timestamp, timestamp),
+    )
+    return int(cur.lastrowid)
+
+
+def confirm_island_import(token, requested_name):
+    record = ISLAND_IMPORT_SESSIONS.get(token)
+    try:
+        name = str(requested_name or "").strip()
+        if not name:
+            raise ValueError("Tên Island không được trống")
+        if len(name) > 120:
+            raise ValueError("Tên Island tối đa 120 ký tự")
+        island = record["island"]
+        timestamp = now_ts()
+        stats = {"canonicalReused": 0, "customReused": 0, "customCreated": 0, "audioRestored": 0}
+        installations = []
+        audio_updates = []
+        prepared_dir = record["stage"] / "prepared"
+        prepared_dir.mkdir(exist_ok=True)
+        with content_conn() as c, user_conn() as u:
+            if _island_name_exists(u, name):
+                raise ValueError("Tên My Island đã tồn tại; hãy chọn tên khác")
+            island_row = u.execute(
+                "INSERT INTO my_islands(name,description,created_at_ts,updated_at_ts) VALUES(?,?,?,?)",
+                (name, island["description"], timestamp, timestamp),
+            )
+            island_id = int(island_row.lastrowid)
+            used_keys = set()
+            for order_index, portable in enumerate(island["items"], 1):
+                content = portable["content"]
+                audio_name = portable.get("audio")
+                audio_hash = record["manifest"]["files"][audio_name]["sha256"].lower() if audio_name else None
+                preferred_id = portable.get("contentId") if portable["kind"] == "canonical" else None
+                key = _find_portable_canonical(c, content, preferred_id)
+                if portable["kind"] == "custom" and not _custom_can_use_canonical(content, audio_name):
+                    key = None
+                if key in used_keys:
+                    key = None
+                custom_id = None
+                attach_audio = False
+                if key:
+                    stats["canonicalReused"] += 1
+                else:
+                    reusable = _find_reusable_portable_custom(u, content, audio_name, audio_hash, used_keys)
+                    if reusable:
+                        custom_id = reusable["id"]
+                        key = reusable["key"]
+                        attach_audio = reusable["attachAudio"]
+                        stats["customReused"] += 1
+                    else:
+                        custom_id = _insert_portable_custom(u, content, timestamp)
+                        key = item_key_custom(custom_id)
+                        attach_audio = bool(audio_name)
+                        stats["customCreated"] += 1
+                used_keys.add(key)
+                u.execute(
+                    "INSERT INTO my_island_members(island_id,order_index,item_key) VALUES(?,?,?)",
+                    (island_id, order_index, key),
+                )
+                if attach_audio:
+                    extension = Path(audio_name).suffix.lower()
+                    filename = f"custom_{custom_id:06d}{extension}"
+                    prepared = prepared_dir / f"{len(installations):05d}{extension}"
+                    shutil.copyfile(record["extracted"].joinpath(*PurePosixPath(audio_name).parts), prepared)
+                    installations.append((prepared, USER_AUDIO / filename, None))
+                    audio_updates.append((filename, timestamp, custom_id))
+            backups = installed = None
+            try:
+                if installations:
+                    USER_AUDIO.mkdir(parents=True, exist_ok=True)
+                    backups, installed = _install_files_atomically(installations, record["stage"])
+                for update in audio_updates:
+                    u.execute(
+                        "UPDATE custom_sentences SET audio_file=?,updated_at_ts=? WHERE id=?", update
+                    )
+                u.commit()
+            except Exception:
+                u.rollback()
+                if backups is not None:
+                    _rollback_installed(backups, installed)
+                raise
+        stats["audioRestored"] = len(audio_updates)
+        return {
+            "ok": True, "id": island_id, "name": name,
+            "itemCount": len(island["items"]), "audioFileCount": len(audio_updates), **stats,
+        }
+    finally:
+        ISLAND_IMPORT_SESSIONS.cleanup(token)
+
+
+def cancel_island_import(token):
+    ISLAND_IMPORT_SESSIONS.cleanup(token)
+    return {"ok": True}
+
+
+def cleanup_orphan_island_import_staging():
+    return {"ok": True, "removed": ISLAND_IMPORT_SESSIONS.cleanup_orphans(_island_import_stage_root())}
 
 
 def decode_base64_blob(data, max_bytes, label="File"):
@@ -2949,6 +3302,34 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
+    def _send_island_export(self, island_id):
+        base = _user_base_dir()
+        base.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix=".island_export_", dir=base))
+        try:
+            with user_conn() as u:
+                row = u.execute("SELECT name FROM my_islands WHERE id=?", (int(island_id),)).fetchone()
+            if not row:
+                raise ValueError("Không tìm thấy My Island")
+            output = work / suggested_island_export_filename(row["name"])
+            create_island_export(island_id, output)
+            # Keep the HTTP header ASCII-safe; browser UI supplies the friendly name.
+            return self.send_file(output, cache=False, download_name=f"My-Island-{int(island_id)}.island.zip")
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    def _receive_island_zip(self):
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type not in ("application/zip", "application/octet-stream"):
+            raise ValueError("Hãy chọn trực tiếp file .island.zip")
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError as exc:
+            raise ValueError("Kích thước file Island không hợp lệ") from exc
+        if length <= 0 or length > MAX_ISLAND_ARCHIVE_BYTES:
+            raise ValueError("File Island trống hoặc vượt giới hạn 512 MB")
+        return self.send_json(prepare_island_import_stream(self.rfile, length))
+
     def _receive_restore_zip(self):
         if RESTORE_SHUTDOWN_CALLBACK is None:
             raise RuntimeError("Restore chỉ khả dụng khi ứng dụng có thể tự đóng hoàn toàn")
@@ -3004,6 +3385,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path=="/api/bootstrap": return self.send_json(get_bootstrap())
             if path=="/api/data/backup": return self._send_user_backup()
+            if path=="/api/my-island/export": return self._send_island_export(int((qs.get("id") or ["0"])[0]))
             if path=="/api/srs/info":
                 item=(qs.get("item_key") or [None])[0]; col=(qs.get("collection_key") or [None])[0]; group=(qs.get("group_key") or [None])[0]
                 return self.send_json(get_srs_info(item,col,group))
@@ -3049,6 +3431,12 @@ class Handler(BaseHTTPRequestHandler):
                     return self._receive_bulk_audio_zip(parsed) if path.endswith("/zip") else self._receive_bulk_audio_file(parsed)
             except Exception as e:
                 return self.send_json({"error":str(e)},400)
+        if path=="/api/my-island/import":
+            try:
+                with USER_DATA_LOCK:
+                    return self._receive_island_zip()
+            except Exception as e:
+                return self.send_json({"error":str(e)},400)
         if RESTORE_SHUTDOWN_PENDING.is_set():
             return self.send_json({"error":"Ứng dụng đang đóng để khôi phục dữ liệu"},503)
         with USER_DATA_LOCK:
@@ -3075,6 +3463,8 @@ class Handler(BaseHTTPRequestHandler):
             if path=="/api/my-island/remove": return self.send_json(remove_from_my_island(data.get("id"),data.get("item_key")))
             if path=="/api/my-island/reorder": return self.send_json(reorder_my_island(data.get("id"),data.get("item_keys")))
             if path=="/api/my-island/import-xlsx": return self.send_json(import_xlsx_to_island(data.get("id"),data.get("xlsx_data")))
+            if path=="/api/my-island/import-confirm": return self.send_json(confirm_island_import(data.get("token"),data.get("name")))
+            if path=="/api/my-island/import-cancel": return self.send_json(cancel_island_import(data.get("token")))
             if path=="/api/bulk-audio/start": return self.send_json(start_bulk_audio_folder_session(data.get("scope"),data.get("target")))
             if path=="/api/bulk-audio/preview": return self.send_json(preview_bulk_audio_session(data.get("token")))
             if path=="/api/bulk-audio/confirm": return self.send_json(confirm_bulk_audio_session(data.get("token")))
@@ -3095,6 +3485,7 @@ def main():
         print("Khôi phục và rollback đều thất bại; không mở app để tránh dùng profile không an toàn.")
         return
     cleanup_orphan_bulk_audio_staging()
+    cleanup_orphan_island_import_staging()
     user_conn().close()
     httpd=ThreadingHTTPServer((HOST,args.port),Handler); url=f"http://{HOST}:{args.port}"
     configure_restore_lifecycle(httpd.shutdown)
