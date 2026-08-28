@@ -92,6 +92,9 @@ class BulkAudioSessions:
         source_path = Path(selected_zip).resolve(strict=True)
         if not source_path.is_file() or source_path.suffix.lower() != ".zip":
             raise ValueError("ZIP audio không hợp lệ")
+        size = source_path.stat().st_size
+        if size <= 0 or size > MAX_TOTAL_BYTES:
+            raise ValueError("ZIP audio vượt giới hạn 1 GB")
         record = self.create(base_dir, scope, target)
         try:
             archive_copy = record["stage"] / "source.zip"

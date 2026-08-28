@@ -53,6 +53,10 @@ MAX_BACKUP_FILE_COUNT = 100000
 MAX_USER_AUDIO_FILE_BYTES = 25 * 1024 * 1024
 MAX_BACKUP_COMPRESSION_RATIO = 500
 RESTORE_DISK_MARGIN_BYTES = 512 * 1024 * 1024
+MAX_XLSX_ARCHIVE_BYTES = 30 * 1024 * 1024
+MAX_XLSX_ZIP_MEMBERS = 2048
+MAX_XLSX_XML_MEMBER_BYTES = 64 * 1024 * 1024
+MAX_XLSX_TOTAL_XML_BYTES = 128 * 1024 * 1024
 SUPPORTED_USER_AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".webm"}
 RESTORE_SHUTDOWN_CALLBACK = None
 RESTORE_SHUTDOWN_PENDING = threading.Event()
@@ -62,7 +66,8 @@ USER_SETTING_DEFAULTS = {
     "desired_retention": "0.90",
     "reschedule_on_retention_change": "0",
     "recall_mode": "vi_en",
-    "shadow_speed": "1.0",
+    "list_speed": "1.00",
+    "shadow_speed": "1.00",
     "shadow_repeat": "3",
     "shadow_pause": "2",
     "list_auto_delay": "1",
@@ -787,6 +792,8 @@ def get_bootstrap():
         reviewed_today = u.execute("SELECT COUNT(*) FROM review_log WHERE review_ts>=? AND review_ts<?", (b0,b1)).fetchone()[0]
         introduced_today = u.execute("SELECT COUNT(*) FROM fsrs_cards WHERE introduced_at_ts>=? AND introduced_at_ts<?", (b0,b1)).fetchone()[0]
         settings = {r["key"]: r["value"] for r in u.execute("SELECT key,value FROM app_settings")}
+        for key in ("list_speed", "shadow_speed"):
+            settings[key] = normalize_playback_speed(settings.get(key), strict=False)
         active_key, active_source = active_source_or_fallback(c, u)
         settings["active_collection_key"] = active_key
         new_limit = int(settings.get("new_per_day", "20"))
@@ -1686,8 +1693,23 @@ def _reschedule_review_cards(u, desired_retention):
     return changed
 
 
+def normalize_playback_speed(value, strict=True):
+    try:
+        speed = float(value)
+    except (TypeError, ValueError):
+        if strict:
+            raise ValueError("Speed không hợp lệ")
+        return "1.00"
+    if not math.isfinite(speed):
+        if strict:
+            raise ValueError("Speed không hợp lệ")
+        return "1.00"
+    speed = round(min(max(speed, 0.25), 2.0) * 20) / 20
+    return f"{speed:.2f}"
+
+
 def update_setting(key,value):
-    allowed={"new_per_day","desired_retention","reschedule_on_retention_change","recall_mode","shadow_speed","shadow_repeat","shadow_pause","list_auto_delay"}
+    allowed={"new_per_day","desired_retention","reschedule_on_retention_change","recall_mode","list_speed","shadow_speed","shadow_repeat","shadow_pause","list_auto_delay"}
     if key not in allowed: raise ValueError("Setting không được hỗ trợ")
     if key=="new_per_day":
         n=int(value); value=str(-1 if n<0 else min(n,500))
@@ -1697,10 +1719,8 @@ def update_setting(key,value):
         value=str(min(max(x,0.70),0.99))
     elif key=="reschedule_on_retention_change":
         value="1" if str(value).strip().lower() in ("1","true","yes","on") else "0"
-    elif key=="shadow_speed":
-        x=float(value)
-        if not math.isfinite(x): raise ValueError("Speed không hợp lệ")
-        value=str(min(max(x,0.5),1.5))
+    elif key in ("list_speed", "shadow_speed"):
+        value=normalize_playback_speed(value)
     elif key=="shadow_repeat": value=str(min(max(int(value),1),10))
     elif key=="shadow_pause":
         x=float(value)
@@ -1795,17 +1815,23 @@ def create_custom_sentence(en_us,vi_vn="",usage_note="",literal_note="",audio_da
             raw=base64.b64decode(audio_data,validate=True)
         except Exception: raise ValueError("File audio không hợp lệ")
         if len(raw)>25*1024*1024: raise ValueError("Audio tối đa 25 MB")
-    with user_conn() as u:
-        ts=now_ts(); cur=u.execute("INSERT INTO custom_sentences(en_us,vi_vn,usage_note,literal_note,audio_file,audio_key,audio_expected,note,created_at_ts,updated_at_ts) VALUES(?,?,?,?,NULL,?,?,?,?,?)",(en[:1000],vi[:1500],(usage_note or "")[:1000],(literal_note or "")[:1000],(audio_key or None),(audio_expected or None),(note or "")[:1000],ts,ts)); cid=cur.lastrowid
-        audio_file=None
-        if raw is not None:
-            ext=safe_audio_ext(audio_name,audio_type); audio_file=f"custom_{cid:06d}{ext}"; (USER_AUDIO/audio_file).write_bytes(raw)
-            u.execute("UPDATE custom_sentences SET audio_file=? WHERE id=?",(audio_file,cid))
-        if island_id:
-            nxt=u.execute("SELECT COALESCE(MAX(order_index),0)+1 FROM my_island_members WHERE island_id=?",(int(island_id),)).fetchone()[0]
-            u.execute("INSERT INTO my_island_members(island_id,order_index,item_key) VALUES(?,?,?)",(int(island_id),nxt,item_key_custom(cid)))
-            u.execute("UPDATE my_islands SET updated_at_ts=? WHERE id=?",(ts,int(island_id)))
-        u.commit()
+    audio_file=None
+    audio_path=None
+    try:
+        with user_conn() as u:
+            ts=now_ts(); cur=u.execute("INSERT INTO custom_sentences(en_us,vi_vn,usage_note,literal_note,audio_file,audio_key,audio_expected,note,created_at_ts,updated_at_ts) VALUES(?,?,?,?,NULL,?,?,?,?,?)",(en[:1000],vi[:1500],(usage_note or "")[:1000],(literal_note or "")[:1000],(audio_key or None),(audio_expected or None),(note or "")[:1000],ts,ts)); cid=cur.lastrowid
+            if raw is not None:
+                ext=safe_audio_ext(audio_name,audio_type); audio_file=f"custom_{cid:06d}{ext}"; audio_path=USER_AUDIO/audio_file; audio_path.write_bytes(raw)
+                u.execute("UPDATE custom_sentences SET audio_file=? WHERE id=?",(audio_file,cid))
+            if island_id:
+                nxt=u.execute("SELECT COALESCE(MAX(order_index),0)+1 FROM my_island_members WHERE island_id=?",(int(island_id),)).fetchone()[0]
+                u.execute("INSERT INTO my_island_members(island_id,order_index,item_key) VALUES(?,?,?)",(int(island_id),nxt,item_key_custom(cid)))
+                u.execute("UPDATE my_islands SET updated_at_ts=? WHERE id=?",(ts,int(island_id)))
+            u.commit()
+    except Exception:
+        if audio_path is not None:
+            audio_path.unlink(missing_ok=True)
+        raise
     return {"ok":True,"custom_id":cid,"item_key":item_key_custom(cid),"audio_file":audio_file}
 
 
@@ -1833,19 +1859,70 @@ def _xlsx_col_index(ref):
     return n - 1
 
 
-def parse_import_xlsx(raw):
+def _validated_xlsx_archive(raw):
+    if len(raw) > MAX_XLSX_ARCHIVE_BYTES:
+        raise ValueError("XLSX quá lớn")
     try:
         z = zipfile.ZipFile(io.BytesIO(raw))
+        infos = z.infolist()
+        if len(infos) > MAX_XLSX_ZIP_MEMBERS:
+            raise ValueError("XLSX có quá nhiều thành phần")
+        seen = set()
+        total_xml = 0
+        for info in infos:
+            pure = PurePosixPath(info.filename.replace('\\', '/'))
+            if pure.is_absolute() or ".." in pure.parts:
+                raise ValueError("XLSX chứa đường dẫn không an toàn")
+            name = str(pure)
+            if name in seen:
+                raise ValueError("XLSX chứa thành phần trùng lặp")
+            seen.add(name)
+            if name.lower().endswith((".xml", ".rels")):
+                if info.file_size < 0 or info.file_size > MAX_XLSX_XML_MEMBER_BYTES:
+                    raise ValueError("Thành phần XML trong XLSX quá lớn")
+                total_xml += info.file_size
+                if total_xml > MAX_XLSX_TOTAL_XML_BYTES:
+                    raise ValueError("Tổng XML trong XLSX quá lớn")
+        return z
+    except ValueError:
+        try: z.close()
+        except Exception: pass
+        raise
     except Exception:
         raise ValueError("XLSX không hợp lệ")
+
+
+def _read_xlsx_xml(z, name):
+    try:
+        info = z.getinfo(name)
+    except KeyError:
+        raise ValueError("XLSX thiếu thành phần bắt buộc")
+    with z.open(info) as source:
+        raw = source.read(MAX_XLSX_XML_MEMBER_BYTES + 1)
+    if len(raw) > MAX_XLSX_XML_MEMBER_BYTES:
+        raise ValueError("Thành phần XML trong XLSX quá lớn")
+    return raw
+
+
+def _parse_xlsx_xml(z, name):
+    try:
+        return ET.fromstring(_read_xlsx_xml(z, name))
+    except ValueError:
+        raise
+    except (ET.ParseError, RuntimeError, zipfile.BadZipFile, OSError) as exc:
+        raise ValueError("XLSX không hợp lệ") from exc
+
+
+def parse_import_xlsx(raw):
+    z = _validated_xlsx_archive(raw)
     ns = {"m":"http://schemas.openxmlformats.org/spreadsheetml/2006/main", "r":"http://schemas.openxmlformats.org/officeDocument/2006/relationships"}
     shared = []
     if "xl/sharedStrings.xml" in z.namelist():
-        root = ET.fromstring(z.read("xl/sharedStrings.xml"))
+        root = _parse_xlsx_xml(z, "xl/sharedStrings.xml")
         for si in root.findall("m:si", ns):
             shared.append("".join(t.text or "" for t in si.iter("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t")))
-    wb = ET.fromstring(z.read("xl/workbook.xml"))
-    relroot = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+    wb = _parse_xlsx_xml(z, "xl/workbook.xml")
+    relroot = _parse_xlsx_xml(z, "xl/_rels/workbook.xml.rels")
     rels = {r.attrib.get("Id"): r.attrib.get("Target") for r in relroot}
     sheets = wb.find("m:sheets", ns)
     target = None
@@ -1862,7 +1939,8 @@ def parse_import_xlsx(raw):
         sheet_path = target
     else:
         sheet_path = "xl/" + target.lstrip("/")
-    root = ET.fromstring(z.read(sheet_path))
+    root = _parse_xlsx_xml(z, sheet_path)
+    z.close()
     matrix = []
     for row in root.findall(".//m:sheetData/m:row", ns):
         vals = {}
@@ -1886,7 +1964,7 @@ def parse_import_xlsx(raw):
         return []
     header_idx = next((i for i,r in enumerate(matrix) if any(str(x).strip() for x in r)), None)
     if header_idx is None: return []
-    headers = [re.sub(r"\\s+", " ", str(x).strip()).casefold() for x in matrix[header_idx]]
+    headers = [re.sub(r"\s+", " ", str(x).strip()).casefold() for x in matrix[header_idx]]
     aliases = {
         "audio key":"audio_key","english":"en_us","vietnamese":"vi_vn",
         "audio file (optional)":"audio_expected","audio file":"audio_expected",
@@ -1912,7 +1990,7 @@ def _normalize_audio_key(s):
 
 
 def import_xlsx_to_island(island_id, xlsx_data):
-    raw = decode_base64_blob(xlsx_data, 30*1024*1024, "XLSX")
+    raw = decode_base64_blob(xlsx_data, MAX_XLSX_ARCHIVE_BYTES, "XLSX")
     rows = parse_import_xlsx(raw)
     if not rows: raise ValueError("XLSX không có câu để import")
     if len(rows) > 10000: raise ValueError("Mỗi lần import tối đa 10.000 câu")

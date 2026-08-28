@@ -206,6 +206,7 @@ def main():
             min_size=(900, 600),
             resizable=True,
             background_color="#f8fafc",
+            text_select=True,
         )
         # Stop the local server as soon as the native window closes. Waiting for
         # webview.start() to unwind first can leave an invisible process briefly.

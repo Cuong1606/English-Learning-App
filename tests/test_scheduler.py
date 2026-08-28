@@ -257,6 +257,40 @@ def test_auto_delay_setting_validation():
         shutil.rmtree(tmp,ignore_errors=True)
 
 
+def test_playback_speed_settings_are_clamped_normalized_and_independent():
+    tmp=Path(tempfile.mkdtemp(prefix='english_speed_setting_test_'))
+    old=(sv.USER_DIR,sv.USER_DB,sv.USER_AUDIO)
+    try:
+        sv.USER_DIR=tmp/'user_data'; sv.USER_DB=sv.USER_DIR/'learning.sqlite'; sv.USER_AUDIO=tmp/'user_audio'
+        sv.user_conn().close()
+        with sv.user_conn() as u:
+            assert sv.setting_get(u,'list_speed')=='1.00'
+            assert sv.setting_get(u,'shadow_speed')=='1.00'
+
+        assert sv.update_setting('list_speed',0.1)['value']=='0.25'
+        assert sv.update_setting('shadow_speed',2.5)['value']=='2.00'
+        assert sv.update_setting('list_speed',1.23)['value']=='1.25'
+        with sv.user_conn() as u:
+            assert sv.setting_get(u,'list_speed')=='1.25'
+            assert sv.setting_get(u,'shadow_speed')=='2.00'
+            u.execute("UPDATE app_settings SET value='broken' WHERE key='shadow_speed'")
+            u.execute("DELETE FROM app_settings WHERE key='list_speed'")
+            u.commit()
+
+        boot=sv.get_bootstrap()
+        assert boot['settings']['list_speed']=='1.00'
+        assert boot['settings']['shadow_speed']=='1.00'
+        for invalid in ('', 'not-a-number', 'nan', 'inf', None):
+            try:
+                sv.update_setting('list_speed',invalid)
+                raise AssertionError(f'accepted invalid speed: {invalid!r}')
+            except ValueError:
+                pass
+    finally:
+        sv.USER_DIR,sv.USER_DB,sv.USER_AUDIO=old
+        shutil.rmtree(tmp,ignore_errors=True)
+
+
 def test_user_conn_creates_missing_parent_directories():
     tmp=Path(tempfile.mkdtemp(prefix='english_fresh_install_test_'))
     old=(sv.USER_DIR,sv.USER_DB,sv.USER_AUDIO)
@@ -556,7 +590,7 @@ def test_user_db_migration_adds_srs_management_without_losing_existing_settings(
         shutil.rmtree(tmp,ignore_errors=True)
 
 def run_all():
-    tests=[test_first_steps,test_reference_random_sequences,test_retention_direction,test_lapse_relearning,test_daily_queue_and_global_card,test_daily_source_switch_preserves_progress_and_deleted_my_island_falls_back,test_course_catalog_is_uniform_and_data_driven,test_auto_delay_setting_validation,test_user_conn_creates_missing_parent_directories,test_review_now_and_reset_preserve_memory_and_history,test_suspend_resume_excluded_from_daily_for_new_and_due_cards,test_bulk_collection_uses_unique_canonical_keys,test_retention_reschedule_off_on_and_learning_untouched,test_course_and_book_bulk_scope,test_english_by_topic_content_runtime_saved_and_srs,test_english_by_topic_import_rolls_back_atomically,test_user_db_migration_adds_srs_management_without_losing_existing_settings]
+    tests=[test_first_steps,test_reference_random_sequences,test_retention_direction,test_lapse_relearning,test_daily_queue_and_global_card,test_daily_source_switch_preserves_progress_and_deleted_my_island_falls_back,test_course_catalog_is_uniform_and_data_driven,test_auto_delay_setting_validation,test_playback_speed_settings_are_clamped_normalized_and_independent,test_user_conn_creates_missing_parent_directories,test_review_now_and_reset_preserve_memory_and_history,test_suspend_resume_excluded_from_daily_for_new_and_due_cards,test_bulk_collection_uses_unique_canonical_keys,test_retention_reschedule_off_on_and_learning_untouched,test_course_and_book_bulk_scope,test_english_by_topic_content_runtime_saved_and_srs,test_english_by_topic_import_rolls_back_atomically,test_user_db_migration_adds_srs_management_without_losing_existing_settings]
     for fn in tests:
         fn(); print('PASS',fn.__name__)
     print(f'PASS ALL: {len(tests)} test groups')

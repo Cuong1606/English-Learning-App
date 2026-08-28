@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import server as sv
+import bulk_audio as bulk_audio_module
 from audio_index import BUNDLED_AUDIO_INDEX
 from bulk_audio import BulkAudioSessions
 
@@ -70,6 +71,123 @@ def test_user_audio_availability_is_live_not_cached():
         assert sv.get_custom_item(custom_id)["audio"]
     finally:
         restore_user(root, old)
+
+
+def test_custom_sentence_audio_rolls_back_with_database_failure():
+    root, old = temp_user("english_custom_audio_atomic_")
+    try:
+        island = sv.create_my_island("Atomic Audio", "")
+        with sv.user_conn() as u:
+            u.execute(
+                "CREATE TRIGGER fail_atomic_member BEFORE INSERT ON my_island_members "
+                "BEGIN SELECT RAISE(ABORT, 'simulated island failure'); END"
+            )
+            u.commit()
+        try:
+            sv.create_custom_sentence(
+                "Must roll back", "Phải rollback", island_id=island["id"],
+                audio_data=base64.b64encode(b"atomic-audio").decode("ascii"),
+                audio_name="atomic.mp3", audio_type="audio/mpeg",
+            )
+            raise AssertionError("simulated database failure was accepted")
+        except Exception as exc:
+            assert "simulated island failure" in str(exc)
+        assert not list(sv.USER_AUDIO.iterdir())
+        with sv.user_conn() as u:
+            assert u.execute("SELECT COUNT(*) FROM custom_sentences WHERE en_us='Must roll back'").fetchone()[0] == 0
+    finally:
+        restore_user(root, old)
+
+
+def _minimal_import_xlsx(extra_members=None, worksheet_override=None):
+    workbook = b'''<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+ xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+ <sheets><sheet name="Import" sheetId="1" r:id="rId1"/></sheets>
+</workbook>'''
+    relationships = b'''<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+ <Relationship Id="rId1" Target="worksheets/sheet1.xml"/>
+</Relationships>'''
+    worksheet = worksheet_override or b'''<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
+ <row r="1"><c r="A1" t="inlineStr"><is><t>Audio&#9;   Key</t></is></c><c r="B1" t="inlineStr"><is><t>English</t></is></c></row>
+ <row r="2"><c r="A2" t="inlineStr"><is><t>T001</t></is></c><c r="B2" t="inlineStr"><is><t>Hello from XLSX</t></is></c></row>
+</sheetData></worksheet>'''
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("xl/workbook.xml", workbook)
+        archive.writestr("xl/_rels/workbook.xml.rels", relationships)
+        archive.writestr("xl/worksheets/sheet1.xml", worksheet)
+        for name, data in extra_members or []:
+            archive.writestr(name, data)
+    return output.getvalue()
+
+
+def test_xlsx_headers_and_archive_limits():
+    rows = sv.parse_import_xlsx(_minimal_import_xlsx())
+    assert rows == [{
+        "audio_key": "T001", "en_us": "Hello from XLSX", "vi_vn": "",
+        "audio_expected": "", "note": "",
+    }]
+
+    old_limits = (
+        sv.MAX_XLSX_ARCHIVE_BYTES,
+        sv.MAX_XLSX_ZIP_MEMBERS,
+        sv.MAX_XLSX_XML_MEMBER_BYTES,
+        sv.MAX_XLSX_TOTAL_XML_BYTES,
+    )
+    try:
+        sv.MAX_XLSX_ARCHIVE_BYTES = 32
+        try:
+            sv.parse_import_xlsx(_minimal_import_xlsx())
+            raise AssertionError("XLSX archive limit was not enforced")
+        except ValueError as exc:
+            assert "XLSX quá lớn" in str(exc)
+
+        sv.MAX_XLSX_ARCHIVE_BYTES = old_limits[0]
+        sv.MAX_XLSX_ZIP_MEMBERS = 3
+        try:
+            sv.parse_import_xlsx(_minimal_import_xlsx([("extra.xml", b"<x/>")]))
+            raise AssertionError("XLSX member limit was not enforced")
+        except ValueError as exc:
+            assert "quá nhiều thành phần" in str(exc)
+
+        sv.MAX_XLSX_ZIP_MEMBERS = old_limits[1]
+        sv.MAX_XLSX_XML_MEMBER_BYTES = 1024
+        try:
+            sv.parse_import_xlsx(_minimal_import_xlsx([("bomb.xml", b"x" * 4096)]))
+            raise AssertionError("XLSX XML member limit was not enforced")
+        except ValueError as exc:
+            assert "XML" in str(exc) and "quá lớn" in str(exc)
+
+        sv.MAX_XLSX_XML_MEMBER_BYTES = old_limits[2]
+        sv.MAX_XLSX_TOTAL_XML_BYTES = 512
+        try:
+            sv.parse_import_xlsx(_minimal_import_xlsx())
+            raise AssertionError("XLSX total XML limit was not enforced")
+        except ValueError as exc:
+            assert "Tổng XML" in str(exc)
+
+        sv.MAX_XLSX_TOTAL_XML_BYTES = old_limits[3]
+        try:
+            sv.parse_import_xlsx(_minimal_import_xlsx([("../escape.xml", b"<x/>")]))
+            raise AssertionError("unsafe XLSX member path was accepted")
+        except ValueError as exc:
+            assert "không an toàn" in str(exc)
+
+        try:
+            sv.parse_import_xlsx(_minimal_import_xlsx(worksheet_override=b"<worksheet"))
+            raise AssertionError("malformed XLSX XML was accepted")
+        except ValueError as exc:
+            assert "XLSX không hợp lệ" in str(exc)
+    finally:
+        (
+            sv.MAX_XLSX_ARCHIVE_BYTES,
+            sv.MAX_XLSX_ZIP_MEMBERS,
+            sv.MAX_XLSX_XML_MEMBER_BYTES,
+            sv.MAX_XLSX_TOTAL_XML_BYTES,
+        ) = old_limits
 
 
 def test_recall_rating_matches_fsrs_and_returns_exact_local_counters():
@@ -268,6 +386,29 @@ def test_bulk_audio_zip_folder_security_large_set_and_rollback():
         bulk_section = frontend.split("function pickBrowserAudio", 1)[1].split("async function showMissingAudio", 1)[0]
         assert "fileToBase64" not in bulk_section and "readAsDataURL" not in bulk_section
         assert "application/octet-stream" in bulk_section and "application/zip" in bulk_section
+
+        native_zip = root / "native-oversized.zip"
+        with zipfile.ZipFile(native_zip, "w") as archive:
+            archive.writestr("T001.mp3", b"too-large-for-test-limit")
+        old_total = bulk_audio_module.MAX_TOTAL_BYTES
+        old_copy = bulk_audio_module.shutil.copyfile
+        copied = {"value": False}
+        def track_copy(*args, **kwargs):
+            copied["value"] = True
+            return old_copy(*args, **kwargs)
+        bulk_audio_module.MAX_TOTAL_BYTES = 8
+        bulk_audio_module.shutil.copyfile = track_copy
+        native_stage = root / "native-oversized-stage"
+        try:
+            try:
+                BulkAudioSessions().from_zip(native_stage, "my", island["id"], native_zip)
+                raise AssertionError("oversized native ZIP was accepted")
+            except ValueError as exc:
+                assert "ZIP audio vượt giới hạn" in str(exc)
+            assert not copied["value"] and not native_stage.exists()
+        finally:
+            bulk_audio_module.MAX_TOTAL_BYTES = old_total
+            bulk_audio_module.shutil.copyfile = old_copy
     finally:
         restore_user(root, old)
 
@@ -392,10 +533,32 @@ def test_desktop_native_picker_bridge_zip_folder_cancel_and_import():
         restore_user(root, old)
 
 
+def test_m1_webview_selection_and_speed_control_contract():
+    desktop = (ROOT / "desktop_app.py").read_text(encoding="utf-8")
+    css = (ROOT / "web" / "style.css").read_text(encoding="utf-8")
+    js = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+
+    assert "text_select=True" in desktop
+    assert "-webkit-user-select:text;user-select:text" in css
+    control = js[js.index("function speedControlHtml"):js.index("function setPlaybackSpeedState")]
+    assert 'type="range"' in control and 'type="number"' in control
+    assert 'min="0.25"' in control and 'max="2.00"' in control and 'step="0.05"' in control
+    preview = js[js.index("function previewPlaybackSpeed"):js.index("async function commitPlaybackSpeed")]
+    assert "playbackRate" not in preview and "post(" not in preview and ".src" not in preview
+    state_update = js[js.index("function setPlaybackSpeedState"):js.index("function syncPlaybackSpeedControls")]
+    assert "player().playbackRate=speed" in state_update
+    commit = js[js.index("async function commitPlaybackSpeed"):js.index("function showPlayer")]
+    assert "'list_speed':'shadow_speed'" in commit and "post('/api/setting'" in commit
+    assert "speedControlHtml('list'" in js and "speedControlHtml('shadow'" in js
+    assert ".speed-number input{width:6.5em;min-width:6.5em}" in css
+
+
 def run_all():
     tests = [
         test_audio_index_builds_once_and_invalidates_explicitly,
         test_user_audio_availability_is_live_not_cached,
+        test_custom_sentence_audio_rolls_back_with_database_failure,
+        test_xlsx_headers_and_archive_limits,
         test_recall_rating_matches_fsrs_and_returns_exact_local_counters,
         test_search_filters_and_canonical_multi_location,
         test_search_scopes_are_applied_before_limit,
@@ -403,6 +566,7 @@ def run_all():
         test_bulk_audio_http_binary_stream_endpoints,
         test_bulk_audio_startup_removes_only_orphan_staging,
         test_desktop_native_picker_bridge_zip_folder_cancel_and_import,
+        test_m1_webview_selection_and_speed_control_contract,
     ]
     for test in tests:
         test(); print("PASS", test.__name__)
